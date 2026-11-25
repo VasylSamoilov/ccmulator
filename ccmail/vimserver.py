@@ -408,6 +408,7 @@ class Interactive:
                 return
             self.user = self.call.user
             log.info("%s: %s logged in, interactive", self.name, self.user)
+            self.call.start_fetch()     # fetched mail shows in the next inbox listing; no wait
             if not self.control_login():
                 return
             self.box = Mailbox(self.po, self.user)
@@ -941,7 +942,7 @@ class Interactive:
             if route:
                 return "route", route
         gw = getattr(self.po, "gateway", None)
-        if gw and gw.enabled and gw.is_external(name, path):
+        if gw and gw.enabled_for(self.user) and gw.is_external(name, path):
             return "external", name
         return None
 

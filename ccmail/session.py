@@ -11,6 +11,7 @@ Per message: 84 | 85 | len(2) record | one verdict per tag-03 entry (82/83) | 86
 """
 import logging
 import struct
+import time
 
 import shutil
 
@@ -83,13 +84,36 @@ class Call:
             return
         log.info("%s: %s logged in%s (%s)", self.name, self.user or "unknown caller",
                  " read-only" if self.readonly else "", mode)
+        fetching = self.start_fetch()
         if self.receive_messages():
             if not self.readonly:
+                self.wait_fetch(fetching)
                 self.send_messages()
             link.write(bytes([C_DONE]))
         # after 8D the post office sends no 88 and hangs up
         link.drain(30)
         log.info("%s: done, %d received, %d sent", self.name, self.received, self.sent)
+
+    def start_fetch(self):
+        """A user with her own "fetch" account (fetch.py): fetch it now, in a thread, while the
+        caller uploads; (thread, deadline) or None."""
+        fetcher = getattr(self.po, "fetcher", None)
+        if not fetcher or not self.user or self.caller_po or self.readonly or not fetcher.has(self.user):
+            return None
+        from .fetch import CALL_WAIT
+        log.info("%s: fetching %s's internet mail", self.name, self.user)
+        return fetcher.start(self.user, CALL_WAIT), time.monotonic() + CALL_WAIT
+
+    def wait_fetch(self, fetching):
+        """Before our turn: wait for the fetch up to its deadline, servicing the link meanwhile
+        (the link is pumped by this thread); a slow server is logged and the call goes on."""
+        if not fetching:
+            return
+        thread, deadline = fetching
+        while thread.is_alive() and time.monotonic() < deadline:
+            self.link.pump(0.1)
+        if thread.is_alive():
+            log.info("%s: fetch for %s still running, sending what is here", self.name, self.user)
 
     def wait_opener(self):
         """Look for ff aa 55 11 anywhere in the delivered data; after 30 s refuse the
@@ -247,7 +271,7 @@ class Call:
                     verdicts.append(C_YES)
                     if route_to not in routed:
                         routed.append(route_to)
-                elif gw and gw.enabled and gw.is_external(name, path):
+                elif gw and gw.enabled_for(self.user) and gw.is_external(name, path):
                     verdicts.append(C_YES)
                     if name not in external:
                         external.append(name)

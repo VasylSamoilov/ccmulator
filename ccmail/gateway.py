@@ -18,8 +18,20 @@ po.json:
         "smarthost": "127.0.0.1:2526",    # outbound SMTP relay (cc:Mail -> internet)
         "starttls": false, "username": "", "password": "",
         "retry_seconds": 3600, "retry_times": 72,   # defaults (smtp-link.md §7)
-        "rfc822_header_item": false       # attach the header as RFC822.TXT (needs file items)
+        "rfc822_header_item": false,      # attach the header as RFC822.TXT (needs file items)
+        "aliases": {"sales": "Smith, Ann", "info@company.com": "user"}   # inbound, before the rules
     }
+    "users": {"Smith, Ann": {"password": "..",
+        "email": "ann@isp.example",       # her From/envelope sender; inbound to it reaches her
+        "smtp": {"host": "smtp.isp.example", "port": 587, "security": "starttls",
+                 "user": "ann@isp.example", "password": "..", "verify_tls": true},
+        "fetch": {...}}}                  # ccmail/fetch.py
+
+Precedence: every per-user setting is optional and a user without them is handled as before.
+A user's "email" replaces the generated address (From, envelope sender, inbound matching); a
+user's "smtp" replaces the shared smarthost for mail she writes, with no fallback to the
+smarthost (failures are retried, then reported to her, as for the smarthost). Per-user settings
+work without "listen"/"smarthost", even without a "gateway" section (post office "INTERNET").
 """
 import datetime
 import email
@@ -32,16 +44,66 @@ import os
 import re
 import smtplib
 import socket
+import ssl
 import threading
 import time
-from email.message import EmailMessage
+from email.message import EmailMessage, MIMEPart
 
+from . import PRODUCT, limits
 from . import message as M
 
 log = logging.getLogger("ccmail.gateway")
 
 IMPORTANCE = {"normal": ("normal", "normal"), "low": ("low", "non-urgent"), "urgent": ("high", "urgent")}
-LINK_VERSION = "ccMail Link to SMTP R8.10.00 compatible (ccmail-server)"
+LINK_VERSION = f"ccMail Link to SMTP R8.10.00 compatible ({PRODUCT})"
+SMTP_SECURITY = ("starttls", "ssl", "none")
+
+
+class ConfigError(Exception):
+    pass
+
+
+def tls_context(verify=True):
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def smtp_config(cfg: dict, user: str) -> dict:
+    """A user's "smtp" entry with defaults: port 587 (465 for "ssl"), security starttls,
+    verify_tls true. Raises ConfigError."""
+    if not isinstance(cfg, dict) or not cfg.get("host"):
+        raise ConfigError(f'user {user}: "smtp" needs a "host"')
+    sec = str(cfg.get("security", "starttls")).lower()
+    if sec not in SMTP_SECURITY:
+        raise ConfigError(f'user {user}: smtp "security" must be one of {", ".join(SMTP_SECURITY)}')
+    try:
+        port = int(cfg.get("port") or (465 if sec == "ssl" else 587))
+    except (TypeError, ValueError):
+        raise ConfigError(f'user {user}: smtp "port" must be a number') from None
+    return {"host": cfg["host"], "port": port,
+            "security": sec, "user": cfg.get("user", ""), "password": cfg.get("password", ""),
+            "verify_tls": bool(cfg.get("verify_tls", True))}
+
+
+def open_smtp(host, port, security, user="", password="", verify_tls=True, timeout=60):
+    """Connected (and logged in) smtplib object. "starttls" fails if the server does not offer
+    it (smtplib raises SMTPNotSupportedError), so the password never goes out in clear text."""
+    if security == "ssl":
+        s = smtplib.SMTP_SSL(host, port, timeout=timeout, context=tls_context(verify_tls))
+    else:
+        s = smtplib.SMTP(host, port, timeout=timeout)
+    try:
+        if security == "starttls":
+            s.starttls(context=tls_context(verify_tls))
+        if user:
+            s.login(user, password)
+    except BaseException:
+        s.close()
+        raise
+    return s
 
 
 class _Recoded:
@@ -91,7 +153,6 @@ class Gateway:
     def __init__(self, po):
         self.po = po
         cfg = po._cfg.get("gateway") or {}
-        self.enabled = bool(cfg)
         self.gw_po = cfg.get("post_office", "INTERNET")
         self.domain = cfg.get("domain", "localhost")
         self.listen = cfg.get("listen")
@@ -103,6 +164,82 @@ class Gateway:
         self.retry_times = cfg.get("retry_times", 72)
         self.outbox = os.path.join(po.root, "outbound")
         self.inbox_log = os.path.join(po.root, "inbound")
+
+    # ----- per-user settings (read live: po.json is reloaded when the admin commands change it) -----
+
+    def _user_entries(self):
+        self.po.refresh()
+        for canon, _ in self.po.users.values():
+            e = self.po._cfg["users"].get(canon)
+            if isinstance(e, dict):
+                yield canon, e
+
+    @property
+    def enabled(self):
+        """A "gateway" section, or any user with her own email/smtp/fetch settings."""
+        self.po.refresh()
+        return bool(self.po._cfg.get("gateway")) or any(
+            e.get("email") or e.get("smtp") or e.get("fetch") for _, e in self._user_entries())
+
+    def enabled_for(self, user) -> bool:
+        """Whether mail from this caller to the internet is accepted: with a "gateway" section
+        as before (queued for the smarthost), else only for a user with her own "smtp"."""
+        self.po.refresh()
+        return bool(self.po._cfg.get("gateway")) or bool(self.po.user_entry(user).get("smtp"))
+
+    @property
+    def aliases(self):
+        """gateway "aliases": {"local part" or "full@address": user}, keys lowercased."""
+        self.po.refresh()
+        a = (self.po._cfg.get("gateway") or {}).get("aliases") or {}
+        return {k.strip().lower(): v for k, v in a.items()}
+
+    def user_email(self, user):
+        """(address, error) of a local user: her "email"; else her smtp "user" when it is an
+        address; ("", error) when she has "smtp" but neither; (None, None) = generated address."""
+        e = self.po.user_entry(user)
+        if e.get("email"):
+            return e["email"].strip(), None
+        if e.get("smtp"):
+            u = str((e["smtp"] or {}).get("user", "")).strip()
+            if is_internet(u):
+                return u, None
+            return "", (f'user {self.po.user(user)} has "smtp" but no "email", and the smtp "user" '
+                        f'is not an address: set "email" in po.json')
+        return None, None
+
+    def config_errors(self):
+        """Problems in the per-user settings, for the log at start."""
+        from . import fetch
+        out = []
+        seen = {}
+        for canon, e in self._user_entries():
+            if e.get("smtp"):
+                try:
+                    smtp_config(e["smtp"], canon)
+                except ConfigError as x:
+                    out.append(str(x))
+                err = self.user_email(canon)[1]
+                if err:
+                    out.append(err)
+            if e.get("fetch"):
+                try:
+                    fetch.fetch_config(e["fetch"], canon)
+                except ConfigError as x:
+                    out.append(str(x))
+            if e.get("email"):
+                key = e["email"].strip().lower()
+                if key in seen:
+                    out.append(f'users {seen[key]} and {canon} have the same "email" {key}')
+                seen[key] = canon
+        return out
+
+    def _local_author(self, msg):
+        """Post office user who wrote msg (author at no post office or at ours), or None."""
+        author = next(iter(msg.entries((M.TAG_FROM,))), (None, msg.author, []))
+        if author[2] and author[2][-1].strip().lower() != self.po.name.lower():
+            return None
+        return self.po.user(author[1])
 
     # ----- cc:Mail -> internet -----
 
@@ -125,22 +262,33 @@ class Gateway:
             lp = local_part(f"{name} at {path[-1].strip()}")    # Name_at_PO (Kit_Walker__at_PO)
         return f"{lp}@{self.domain}"
 
+    def sender_address(self, msg: M.Message):
+        """(From address, local user or None, config error or None). A local author's own
+        "email" wins over the generated address (smtp-link.md §2.2)."""
+        user = self._local_author(msg)
+        if user:
+            addr, err = self.user_email(user)
+            if addr or err:
+                return addr, user, err
+        author = next(iter(msg.entries((M.TAG_FROM,))), (None, msg.author, []))
+        return self.address_of(author[1], author[2]), user, None
+
     def to_email(self, msg: M.Message, recipients) -> EmailMessage:
         from .codepage import tables
+        from_addr = self.sender_address(msg)[0]
         names_cp, subject_cp, text_cp = msg.codepages(self.po.user_codepage(msg.author))
         # Message decodes header strings as cp850, which maps all 256 bytes: get the bytes back
         # and decode them with the message's real code page (codepages.md 5.4)
         u = lambda s, cp: tables().decode(s.encode("cp850"), cp)   # noqa: E731
         msg = _Recoded(msg, lambda s: u(s, names_cp), u(msg.subject, subject_cp))
         em = EmailMessage(policy=email.policy.SMTP)
-        em["Received"] = f"from ccMail by {self.domain} (ccmail-server); " + email.utils.format_datetime(
+        em["Received"] = f"from ccMail by {self.domain} ({PRODUCT}); " + email.utils.format_datetime(
             datetime.datetime.now().astimezone())
         em["Message-ID"] = email.utils.make_msgid(domain=self.domain)
         em["X-Mailer"] = LINK_VERSION
         when = msg.when or datetime.datetime.now()
         em["Date"] = email.utils.format_datetime(when.astimezone())    # DST applied
         author = next(iter(msg.entries((M.TAG_FROM,))), (None, msg.author, []))
-        from_addr = self.address_of(author[1], author[2])
         em["From"] = email.utils.formataddr((msg.author, from_addr)) if not self._is_gw(author[2]) else from_addr
         if any(t == M.TAG_RECEIPT for t, _ in msg.addr_tlvs):
             em["Return-Receipt-To"] = from_addr
@@ -160,16 +308,20 @@ class Gateway:
         imp, pri = IMPORTANCE.get(msg.priority, IMPORTANCE["normal"])
         em["Importance"], em["Priority"] = imp, pri                  # always both
         items = msg.logical_items()
-        texts = [it["data"] for it in items if it["type"] == "text" and it["data"]]
+        # a text item of only line ends/blanks (a message with just an attachment) is empty
+        texts = [it["data"] for it in items if it["type"] == "text" and it["data"].strip()]
         others = [it for it in items if it["type"] != "text"]
-        parts = [tables().decode(t, text_cp).replace("\r\n", "\n") for t in texts] or [""]
-        if len(parts) == 1 and not others:
-            self._set_text(em, parts[0])
+        parts = [tables().decode(t, text_cp).replace("\r\n", "\n") for t in texts]
+        if len(parts) <= 1 and not others:
+            self._set_text(em, parts[0] if parts else "")       # one item: not multipart (§2.4)
         else:
-            em.set_content("")
+            # several items: multipart/mixed with one part per item and nothing else (smtp-link.md
+            # §2.4). make_mixed() on an empty message gives an empty part list; a
+            # set_content("") before it became an empty text/plain first part
+            em["MIME-Version"] = "1.0"
             em.make_mixed()
             for p in parts:
-                sub = EmailMessage(policy=email.policy.SMTP)
+                sub = MIMEPart(policy=email.policy.SMTP)
                 self._set_text(sub, p)
                 em.attach(sub)
             fax_n = 0
@@ -193,7 +345,9 @@ class Gateway:
         else:
             name, ctype = f"ITEM{it['index']}.{it['type'][:3].upper()}", "application/octet-stream"
         maintype, subtype = ctype.split("/", 1)
-        em.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+        part = MIMEPart(policy=email.policy.SMTP)        # a part carries no MIME-Version of its own
+        part.set_content(data, maintype=maintype, subtype=subtype, disposition="attachment", filename=name)
+        em.attach(part)
 
     @staticmethod
     def _set_text(part, text):
@@ -210,17 +364,54 @@ class Gateway:
         mid = self.po._new_id()
         em = self.to_email(msg, recipients)
         rcpt = [bare_address(r) for r in recipients]
-        author = next(iter(msg.entries((M.TAG_FROM,))), (None, msg.author, []))
+        from_addr, user, error = self.sender_address(msg)
+        meta = {"rcpt": rcpt, "from": from_addr, "author": msg.author, "subject": msg.subject,
+                "tries": 0, "next": 0}
+        # the route is fixed here, since From is written into the .eml now: "via" = the user whose
+        # own smtp sends it; no "via" (also in older queue files) = the shared smarthost
+        if user and self.po.user_entry(user).get("smtp"):
+            meta["via"] = user
+        if error:
+            meta["config_error"] = error
+            log.error("outbound %s: %s", mid, error)
         with open(os.path.join(self.outbox, mid + ".eml"), "wb") as f:
             f.write(em.as_bytes())
         with open(os.path.join(self.outbox, mid + ".json"), "w") as f:
-            json.dump({"rcpt": rcpt, "from": self.address_of(author[1], author[2]),
-                       "author": msg.author, "subject": msg.subject, "tries": 0, "next": 0}, f)
-        log.info("queued %s for %s", mid, ", ".join(rcpt))
+            json.dump(meta, f)
+        log.info("queued %s for %s%s", mid, ", ".join(rcpt), f" via {user}'s smtp" if meta.get("via") else "")
         return mid
 
+    def _route(self, meta):
+        """(open connection function, description) for a queued message. A user route uses only
+        that user's server: ConfigError if her settings are gone or wrong (retried, never sent
+        through the smarthost)."""
+        via = meta.get("via")
+        if via:
+            cfg = self.po.user_entry(via).get("smtp")
+            if not cfg:
+                raise ConfigError(f'user {via} has no "smtp" settings any more')
+            c = smtp_config(cfg, via)
+            return (lambda: open_smtp(c["host"], c["port"], c["security"], c["user"], c["password"],
+                                      c["verify_tls"])), f"{via}'s smtp {c['host']}:{c['port']}"
+        if not self.smarthost:
+            return None, None
+        host, port = self.smarthost.rsplit(":", 1)
+
+        def shared():
+            s = smtplib.SMTP(host, int(port), timeout=60)
+            try:
+                if self.starttls:
+                    s.starttls()
+                if self.username:
+                    s.login(self.username, self.password)
+            except BaseException:
+                s.close()
+                raise
+            return s
+        return shared, self.smarthost
+
     def send_queue(self):
-        if not self.smarthost or not os.path.isdir(self.outbox):
+        if not os.path.isdir(self.outbox):
             return
         for fn in sorted(os.listdir(self.outbox)):
             if not fn.endswith(".json"):
@@ -233,17 +424,23 @@ class Gateway:
                 continue
             with open(os.path.join(self.outbox, mid + ".eml"), "rb") as f:
                 data = f.read()
-            host, port = self.smarthost.rsplit(":", 1)
-            permanent = None
+            # a sender without a usable address (smtp but no email) is refused at once
+            permanent = meta.get("config_error")
+            route = "not sent"
             try:
-                with smtplib.SMTP(host, int(port), timeout=60) as s:
-                    if self.starttls:
-                        s.starttls()
-                    if self.username:
-                        s.login(self.username, self.password)
-                    refused = s.sendmail(meta["from"], meta["rcpt"], data)
-                    if refused:
-                        permanent = "; ".join(f"{a}: {c} {r.decode(errors='replace')}" for a, (c, r) in refused.items())
+                if not permanent:
+                    connect, route = self._route(meta)
+                    if connect is None:
+                        continue                    # shared mail and no smarthost: stays queued
+                    with connect() as s:
+                        refused = s.sendmail(meta["from"], meta["rcpt"], data)
+                        if refused:
+                            permanent = "; ".join(f"{a}: {c} {r.decode(errors='replace')}"
+                                                  for a, (c, r) in refused.items())
+            except ConfigError as e:
+                log.error("outbound %s: %s", mid, e)
+                self._retry(meta, meta_path, mid, str(e))
+                continue
             except smtplib.SMTPRecipientsRefused as e:
                 permanent = "; ".join(f"{a}: {c} {r.decode(errors='replace')}" for a, (c, r) in e.recipients.items())
             except smtplib.SMTPResponseException as e:
@@ -262,8 +459,8 @@ class Gateway:
             os.makedirs(folder, exist_ok=True)
             os.replace(os.path.join(self.outbox, mid + ".eml"), os.path.join(folder, mid + ".eml"))
             os.remove(meta_path)
-            log.info("%s %s to %s via %s", "refused" if permanent else "sent", mid, ", ".join(meta["rcpt"]),
-                     self.smarthost)
+            log.info("%s %s to %s via %s%s", "refused" if permanent else "sent", mid, ", ".join(meta["rcpt"]),
+                     route, f": {permanent}" if permanent else "")
 
     def _retry(self, meta, meta_path, mid, error):
         meta["tries"] += 1
@@ -291,13 +488,26 @@ class Gateway:
     # ----- internet -> cc:Mail -----
 
     def local_user(self, address: str):
-        """Recipient address -> post office user (smtp-link.md §3.3, Smart Addressing): exact name,
-        "_"/"." as space, Name_at_PO for our post office, postmaster/root -> administrator."""
+        """Recipient address -> post office user. First ours: gateway "aliases" (full address,
+        then the local part when the domain is ours), a user's own "email" (any domain). Then
+        the gateway's rules (smtp-link.md §3.3, Smart Addressing): exact name, "_"/"." as space,
+        Name_at_PO for our post office, postmaster/root -> administrator."""
         addr = email.utils.parseaddr(address)[1]
         if "@" not in addr:
             return None
         local, dom = addr.rsplit("@", 1)
-        if dom.lower() != self.domain.lower():
+        ours = dom.lower() == self.domain.lower()
+        aliases = self.aliases
+        for key in (addr.lower(),) + ((local.strip('"').lower(),) if ours else ()):
+            if key in aliases:
+                u = self.po.user(aliases[key])
+                if u:
+                    return u
+                log.warning("gateway alias %s -> %r: no such user", key, aliases[key])
+        for canon, e in self._user_entries():
+            if (e.get("email") or e.get("smtp")) and (self.user_email(canon)[0] or "").lower() == addr.lower():
+                return canon
+        if not ours:
             return None
         local = local.strip('"')
         m = re.fullmatch(r"(.+?)_at_(.+)", local, re.I)
@@ -333,7 +543,16 @@ class Gateway:
         body = em.get_body(preferencelist=("plain", "html"))
         text = ""
         if body is not None:
-            text = body.get_content()
+            try:
+                text = body.get_content()
+            except (LookupError, UnicodeError):
+                # unknown charset label: UTF-8 if it is that, else byte for byte (ISO-8859-1),
+                # so one odd message cannot stop delivery (or a user's fetch) for good
+                data = body.get_payload(decode=True) or b""
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = data.decode("iso-8859-1")
             if body.get_content_type() == "text/html":
                 text = html.unescape(re.sub(r"<[^>]+>", "", text))
         # attachments -> file items, named from Content-Type name / Content-Disposition filename /
@@ -357,7 +576,8 @@ class Gateway:
         extra = []
         for tag, hdr in ((M.TAG_SENT_TO, "To"), (M.TAG_CC_SENT, "Cc")):
             for _, a in email.utils.getaddresses(em.get_all(hdr, [])):
-                if a and not a.lower().endswith("@" + self.domain.lower()):
+                # local users (also by alias or own "email", e.g. fetched mail) are not repeated
+                if a and not a.lower().endswith("@" + self.domain.lower()) and not self.local_user(a):
                     extra.append((tag, a, self.gw_po))
         receipt = bool(em.get("Return-Receipt-To"))
         if len(text) > 60000:
@@ -387,8 +607,9 @@ class Gateway:
 
         rcpts = []
         hops = 0
+        mail_from = ""
         try:
-            reply(f"220 {self.domain} ccmail-server ESMTP")
+            reply(f"220 {self.domain} {PRODUCT} ESMTP")
             while True:
                 line = f.readline(1000)
                 if not line:
@@ -399,6 +620,7 @@ class Gateway:
                     reply(f"250 {self.domain}")
                 elif verb == "MAIL":
                     rcpts = []
+                    mail_from = cmd[5:].strip()
                     reply("250 OK")
                 elif verb == "RCPT":
                     user = self.local_user(cmd[8:].strip().strip("<>"))
@@ -422,7 +644,8 @@ class Gateway:
                     if hops > 30:
                         reply("554 too many hops (mail loop)")         # loop guard
                     else:
-                        self.deliver_inbound(bytes(data), rcpts)
+                        self.deliver_inbound(bytes(data), rcpts,
+                                             source=f"SMTP from {addr[0]}, {mail_from or 'MAIL FROM:<>'}")
                         reply("250 queued for cc:Mail")
                     rcpts = []
                 elif verb == "RSET":
@@ -440,17 +663,98 @@ class Gateway:
         finally:
             conn.close()
 
-    def deliver_inbound(self, raw: bytes, users):
+    def deliver_inbound(self, raw: bytes, users, source=None):
+        """Convert and deposit for each user. source = where it came from (SMTP peer, fetch
+        account), used in the notice when the mail cannot be converted. The raw mail is kept as
+        inbound/<id>.eml either way."""
         users = list(dict.fromkeys(users))
         os.makedirs(self.inbox_log, exist_ok=True)
         mid = self.po._new_id()
-        with open(os.path.join(self.inbox_log, mid + ".eml"), "wb") as f:
+        eml = os.path.join(self.inbox_log, mid + ".eml")
+        with open(eml, "wb") as f:
             f.write(raw)
         msg = None
         for u in users:                     # each recipient gets the text in its own code page
-            msg = self.from_email(raw, users, codepage=self.po.user_codepage(u))
+            cp = self.po.user_codepage(u)
+            try:
+                msg = self.from_email(raw, users, codepage=cp)
+            except Exception as e:          # noqa: BLE001 - any failure: tell the user, keep the raw mail
+                log.exception("inbound %s for %s cannot be converted", mid, u)
+                msg = self.unconvertible_notice(raw, u, e, source, os.path.relpath(eml, self.po.root), cp)
             self.po.deposit(u, msg)
         log.info("inbound %s from %r for %s: %r", mid, msg.author, ", ".join(users), msg.subject)
+        return msg
+
+    def unconvertible_notice(self, raw, user, error, source, kept, codepage):
+        """A plain message for the user about mail that could not be converted: where and when it
+        came from, every header that can still be read, the parts, a text excerpt if one is
+        readable, and why the conversion failed."""
+        import email.header
+        import email.parser
+
+        def hdr(v):
+            if v is None:
+                return ""
+            try:
+                return str(email.header.make_header(email.header.decode_header(str(v))))
+            except Exception:       # noqa: BLE001 - an undecodable header is shown as it is
+                return str(v)
+
+        lines = ["A message could not be converted to cc:Mail and was not delivered as such.", ""]
+        lines.append(f"Received: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
+        if source:
+            lines.append(f"Came from: {source}")
+        lines.append(f"Size: {len(raw)} bytes")
+        try:
+            em = email.parser.BytesParser(policy=email.policy.compat32).parsebytes(raw)
+        except Exception:           # noqa: BLE001
+            em = None
+        try:
+            hd = em or email.parser.BytesHeaderParser(policy=email.policy.compat32).parsebytes(raw)
+        except Exception:           # noqa: BLE001
+            hd = None
+        subject = ""
+        if hd is not None:
+            lines.append("")
+            for name in ("From", "Sender", "Reply-To", "To", "Cc", "Date", "Subject", "Message-ID",
+                         "Content-Type"):
+                for v in hd.get_all(name) or []:
+                    lines.append(f"{name}: {hdr(v)}")
+            subject = hdr(hd.get("Subject")).strip()
+        excerpt = None
+        if em is not None and em.is_multipart():
+            parts = []
+            for part in em.walk():
+                if part.is_multipart():
+                    continue
+                try:
+                    payload = part.get_payload(decode=True) or b""
+                except Exception:   # noqa: BLE001
+                    payload = b""
+                name = part.get_filename()
+                parts.append(f"  {part.get_content_type()}" + (f" {hdr(name)!r}" if name else "")
+                             + f", {len(payload)} bytes")
+                if excerpt is None and part.get_content_type() == "text/plain" and not name:
+                    excerpt = payload
+            if parts:
+                lines += ["", "Parts:"] + parts
+        elif em is not None:
+            try:
+                excerpt = em.get_payload(decode=True)
+            except Exception:       # noqa: BLE001
+                excerpt = None
+        if excerpt:
+            text = excerpt.decode("utf-8", "replace") if isinstance(excerpt, bytes) else str(excerpt)
+            body = ["".join(ch if ch.isprintable() or ch == "\t" else "?" for ch in ln.rstrip())
+                    for ln in text.splitlines()][:20]
+            lines += ["", "Beginning of the text:"] + ["  " + ln for ln in body]
+        lines += ["", f"Why it could not be converted: {type(error).__name__}: {error}",
+                  f"The original is kept on the post office as {kept}."]
+        title = "Message could not be converted"
+        if subject:
+            title = (title + ": " + subject)[:limits.SUBJECT_MAX]
+        return M.compose("Postmaster", [user], title, "\r\n".join(lines), author_po=self.gw_po,
+                         codepage=codepage)
 
     def run_sender(self):
         while True:

@@ -1,0 +1,458 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright 2026 Vasyl Samoilov
+"""Gateway: per-user email address, per-user outgoing SMTP, aliases, the precedence rule (a user
+without settings behaves as before; user settings win; no fallback to the smarthost), the MIME
+part layout of smtp-link.md §2.4 and the product name. Fake SMTP servers on localhost threads, no
+network. Data in a scratch directory (CCMAIL_TEST_DIR, else the system temp directory)."""
+import base64
+import email
+import email.policy
+import json
+import os
+import shutil
+import socket
+import struct
+import tempfile
+import threading
+import unittest
+
+from ccmail import PRODUCT, admin
+from ccmail import message as M
+from ccmail.gateway import Gateway
+from ccmail.link import Link
+from ccmail.message import compose
+from ccmail.session import Call
+from ccmail.store import PostOffice
+
+WORK = os.path.join(os.environ.get("CCMAIL_TEST_DIR") or os.path.join(tempfile.gettempdir(), "ccmulator-tests"),
+                    "gateway-tests")
+
+
+class FakeSMTP:
+    """Records each transaction: {"from", "rcpt", "data", "auth"}; reject = RCPT reply code."""
+
+    def __init__(self, reject=None):
+        self.mails, self.reject = [], reject
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(4)
+        self.port = self.srv.getsockname()[1]
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self.srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._session, args=(conn,), daemon=True).start()
+
+    def close(self):
+        self.srv.close()
+
+    def _session(self, conn):
+        f = conn.makefile("rb")
+        send = lambda s: conn.sendall(s.encode() + b"\r\n")  # noqa: E731
+        send("220 fake ESMTP")
+        cur = {"from": None, "rcpt": [], "auth": None}
+        try:
+            while True:
+                line = f.readline()
+                if not line:
+                    return
+                cmd = line.decode("latin-1").strip()
+                verb = cmd[:4].upper()
+                if verb == "EHLO":
+                    send("250-fake")
+                    send("250 AUTH PLAIN")
+                elif verb == "AUTH":
+                    _authzid, user, pw = base64.b64decode(cmd.split()[2]).split(b"\0")   # AUTH PLAIN
+                    cur["auth"] = (user.decode(), pw.decode())
+                    send("235 ok")
+                elif verb == "MAIL":
+                    cur["from"] = cmd[10:].strip().strip("<>")
+                    send("250 ok")
+                elif verb == "RCPT":
+                    if self.reject:
+                        send(f"{self.reject} no such user")
+                    else:
+                        cur["rcpt"].append(cmd[8:].strip().strip("<>"))
+                        send("250 ok")
+                elif verb == "DATA":
+                    send("354 go")
+                    data = bytearray()
+                    while True:
+                        ln = f.readline()
+                        if not ln or ln in (b".\r\n", b".\n"):
+                            break
+                        data += ln[1:] if ln.startswith(b"..") else ln
+                    cur["data"] = bytes(data)
+                    self.mails.append(dict(cur))
+                    send("250 stored")
+                elif verb == "QUIT":
+                    send("221 bye")
+                    return
+                else:
+                    send("250 ok")
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+
+def closed_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+class GatewayBase(unittest.TestCase):
+    def setUp(self):
+        self.root = os.path.join(WORK, self.id().rsplit(".", 1)[-1])
+        shutil.rmtree(self.root, ignore_errors=True)
+        os.makedirs(self.root)
+        self.smarthost = FakeSMTP()
+        self.own = FakeSMTP()
+        self.addCleanup(self.smarthost.close)
+        self.addCleanup(self.own.close)
+
+    def configure(self, gateway="default", **users):
+        conf = {"post_office": "MYPOST", "codepage": 437,
+                "users": {"Smith, Ann": "123", "bob": "123", "user": "123", "admin": "123"}}
+        if gateway == "default":
+            gateway = {"post_office": "INTERNET", "domain": "mypost.example",
+                       "smarthost": f"127.0.0.1:{self.smarthost.port}", "retry_seconds": 0, "retry_times": 2}
+        if gateway is not None:
+            conf["gateway"] = gateway
+        for name, extra in users.items():
+            name = {"ann": "Smith, Ann"}.get(name, name)
+            conf["users"][name] = dict({"password": "123"}, **extra)
+        with open(os.path.join(self.root, "po.json"), "w", encoding="utf-8") as f:
+            json.dump(conf, f)
+        self.po = PostOffice(self.root)
+        self.gw = self.po.gateway = Gateway(self.po)
+        return self.gw
+
+    def ann_smtp(self, **kw):
+        return dict({"host": "127.0.0.1", "port": self.own.port, "security": "none",
+                     "user": "ann@isp.example", "password": "pw"}, **kw)
+
+    def send(self, author, to="bob@example.com"):
+        msg = compose(author, [f"{to} at INTERNET"], "hello", "text line", author_po="MYPOST")
+        mid = self.gw.queue_outbound(msg, [to])
+        self.gw.send_queue()
+        return mid
+
+    def parsed(self, mail):
+        return email.message_from_bytes(mail["data"], policy=email.policy.default)
+
+    def mailbox(self, user):
+        return [m for _, m in self.po.pending(user)]
+
+
+class MimeTest(GatewayBase):
+    def test_text_and_file_no_empty_part(self):
+        gw = self.configure()
+        msg = compose("bob", ["x@example.com at INTERNET"], "s", "the note", attachments=[("A.TXT", b"abc")])
+        em = gw.to_email(msg, ["x@example.com"])
+        parts = list(em.iter_parts())
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[0].get_content().strip(), "the note")
+        self.assertEqual(parts[0]["Content-Description"], '"cc:Mail Note Part"')
+        self.assertEqual(parts[1].get_filename(), "A.TXT")
+        self.assertEqual(parts[1].get_payload(decode=True), b"abc")
+        self.assertEqual(em["MIME-Version"], "1.0")
+        self.assertTrue(all(p["MIME-Version"] is None for p in parts))   # only the top level
+        self.assertNotIn(b"\n\n\n--", em.as_bytes().replace(b"\r", b""))
+
+    def test_file_only_no_text_part(self):
+        gw = self.configure()
+        msg = compose("bob", ["x@example.com at INTERNET"], "s", "", attachments=[("A.BIN", b"\0\1\2")])
+        # compose always makes a text item; holding only CR LF it is empty and gets no part
+        self.assertEqual([it["data"] for it in msg.logical_items() if it["type"] == "text"], [b"\r\n"])
+        em = gw.to_email(msg, ["x@example.com"])
+        self.assertEqual([p.get_content_type() for p in em.iter_parts()], ["application/octet-stream"])
+
+    def test_two_text_items_two_parts(self):
+        gw = self.configure()
+        msg = compose("bob", ["x@example.com at INTERNET"], "s", "first")
+        items = msg.logical_items()
+        second = dict(items[0], index=items[0]["index"] + 1, data=b"second\r\n")
+        msg.logical_items = lambda: items + [second]
+        parts = list(gw.to_email(msg, ["x@example.com"]).iter_parts())
+        self.assertEqual([p.get_content().strip() for p in parts], ["first", "second"])
+
+    def test_single_text_not_multipart(self):
+        gw = self.configure()
+        em = gw.to_email(compose("bob", ["x@example.com at INTERNET"], "s", "just text"), ["x@example.com"])
+        self.assertEqual(em.get_content_type(), "text/plain")
+        self.assertEqual(em.get_content().strip(), "just text")
+
+    def test_product_name(self):
+        gw = self.configure()
+        raw = gw.to_email(compose("bob", ["x@example.com at INTERNET"], "s", "t"), ["x@example.com"]).as_bytes()
+        self.assertIn(f"({PRODUCT})".encode(), raw)
+        self.assertNotIn(b"ccmail-server", raw)
+        em = email.message_from_bytes(raw, policy=email.policy.default)
+        self.assertIn(f"({PRODUCT})", em["X-Mailer"])
+        self.assertIn(f"({PRODUCT})", str(em["Received"]))
+
+
+class OutboundTest(GatewayBase):
+    def test_no_settings_as_before(self):
+        self.configure()
+        self.send("bob")
+        self.assertEqual(len(self.smarthost.mails), 1)
+        m = self.smarthost.mails[0]
+        self.assertEqual((m["from"], m["rcpt"], m["auth"]), ("bob@mypost.example", ["bob@example.com"], None))
+        self.assertEqual(self.parsed(m)["From"].addresses[0].addr_spec, "bob@mypost.example")
+        self.assertEqual(self.own.mails, [])
+
+    def test_email_only_uses_smarthost(self):
+        self.configure(ann={"email": "ann@isp.example"})
+        self.send("Smith, Ann")
+        m = self.smarthost.mails[0]
+        self.assertEqual(m["from"], "ann@isp.example")
+        self.assertEqual(self.parsed(m)["From"].addresses[0].addr_spec, "ann@isp.example")
+        self.assertEqual(self.parsed(m)["From"].addresses[0].display_name, "Smith, Ann")
+
+    def test_user_smtp_routing(self):
+        self.configure(ann={"email": "ann.smith@isp.example", "smtp": self.ann_smtp()})
+        self.send("Smith, Ann")
+        self.send("bob")
+        self.assertEqual(len(self.own.mails), 1)
+        m = self.own.mails[0]
+        self.assertEqual((m["from"], m["rcpt"], m["auth"]),
+                         ("ann.smith@isp.example", ["bob@example.com"], ("ann@isp.example", "pw")))
+        self.assertEqual(self.parsed(m)["From"].addresses[0].addr_spec, "ann.smith@isp.example")
+        self.assertEqual([x["from"] for x in self.smarthost.mails], ["bob@mypost.example"])
+        self.assertEqual(os.listdir(os.path.join(self.root, "outbound")), [])
+
+    def test_smtp_user_as_address(self):
+        self.configure(ann={"smtp": self.ann_smtp()})
+        self.send("Smith, Ann")
+        self.assertEqual(self.own.mails[0]["from"], "ann@isp.example")
+
+    def test_smtp_without_address_refused(self):
+        self.configure(ann={"smtp": self.ann_smtp(user="ann")})
+        self.assertTrue(any("no \"email\"" in e for e in self.gw.config_errors()))
+        self.send("Smith, Ann")
+        self.assertEqual((self.own.mails, self.smarthost.mails), ([], []))
+        reports = self.mailbox("Smith, Ann")
+        self.assertEqual(len(reports), 1)
+        self.assertIn('set "email"', reports[0].to_text())
+        self.assertEqual(len(os.listdir(os.path.join(self.root, "failed"))), 1)
+
+    def test_no_fallback_to_smarthost(self):
+        self.configure(ann={"email": "ann@isp.example", "smtp": self.ann_smtp(port=closed_port())})
+        self.send("Smith, Ann")
+        self.assertEqual(len(os.listdir(os.path.join(self.root, "outbound"))), 2)    # kept for retry
+        self.gw.send_queue()                                   # retry_times 2: gives up now
+        self.assertEqual(self.smarthost.mails, [])
+        self.assertEqual(os.listdir(os.path.join(self.root, "outbound")), [])
+        reports = self.mailbox("Smith, Ann")
+        self.assertEqual(len(reports), 1)
+        self.assertIn("gave up after 2 attempts", reports[0].to_text())
+
+    def test_user_smtp_removed_after_queueing(self):
+        self.configure(ann={"email": "ann@isp.example", "smtp": self.ann_smtp(port=closed_port())})
+        msg = compose("Smith, Ann", ["bob@example.com at INTERNET"], "hello", "t", author_po="MYPOST")
+        self.gw.queue_outbound(msg, ["bob@example.com"])
+        self.po.update(lambda cfg: cfg["users"]["Smith, Ann"].pop("smtp"))
+        self.gw.send_queue()
+        self.gw.send_queue()
+        self.assertEqual(self.smarthost.mails, [])
+        self.assertIn("no \"smtp\" settings", self.mailbox("Smith, Ann")[0].to_text())
+
+    def test_starttls_not_offered(self):
+        self.configure(ann={"email": "ann@isp.example", "smtp": self.ann_smtp(security="starttls")})
+        self.send("Smith, Ann")
+        self.assertEqual((self.own.mails, self.smarthost.mails), ([], []))
+        with open(os.path.join(self.root, "outbound", os.listdir(os.path.join(self.root, "outbound"))[0]
+                               .rsplit(".", 1)[0] + ".json")) as f:
+            meta = json.load(f)
+        self.assertEqual((meta["via"], meta["tries"]), ("Smith, Ann", 1))
+        self.assertIn("STARTTLS", meta["error"])
+
+    def test_relay_refusal_bounces(self):
+        self.own.reject = 550
+        self.configure(ann={"email": "ann@isp.example", "smtp": self.ann_smtp()})
+        self.send("Smith, Ann")
+        self.assertIn("550", self.mailbox("Smith, Ann")[0].to_text())
+
+    def test_without_gateway_section(self):
+        """Only a user's smtp: no listen, no smarthost, no "gateway" at all."""
+        self.configure(gateway=None, ann={"email": "ann@isp.example", "smtp": self.ann_smtp()})
+        self.assertTrue(self.gw.enabled)
+        self.assertTrue(self.gw.enabled_for("Smith, Ann"))
+        self.assertFalse(self.gw.enabled_for("bob"))
+        self.send("Smith, Ann")
+        self.assertEqual(self.own.mails[0]["from"], "ann@isp.example")
+        # bob (no settings) is not sent anywhere: no smarthost, the message stays queued
+        self.send("bob")
+        self.assertEqual(len(self.own.mails), 1)
+
+    def test_no_settings_no_gateway_unchanged(self):
+        self.configure(gateway=None)
+        self.assertFalse(self.gw.enabled)
+        self.assertFalse(self.gw.enabled_for("bob"))
+
+
+class InboundTest(GatewayBase):
+    def setUp(self):
+        super().setUp()
+        gw = {"post_office": "INTERNET", "domain": "mypost.example",
+              "aliases": {"sales": "Smith, Ann", "info@company.com": "user", "Help@Company.com": "bob",
+                          "ghost": "nobody"}}
+        self.configure(gateway=gw, ann={"email": "Ann@ISP.example"})
+
+    def test_local_user(self):
+        lu = self.gw.local_user
+        self.assertEqual(lu("sales@mypost.example"), "Smith, Ann")
+        self.assertEqual(lu("<info@company.com>"), "user")
+        self.assertEqual(lu("help@company.com"), "bob")             # case-insensitive keys
+        self.assertIsNone(lu("sales@other.example"))                # local-part alias: our domain only
+        self.assertEqual(lu("ann@isp.example"), "Smith, Ann")       # her own address, any domain
+        self.assertEqual(lu("bob@mypost.example"), "bob")           # generated rules still work
+        self.assertEqual(lu('"Smith,_Ann"@mypost.example'), "Smith, Ann")
+        self.assertEqual(lu("postmaster@mypost.example"), "admin")
+        self.assertIsNone(lu("ghost@mypost.example"))               # alias to no user: not found
+        self.assertIsNone(lu("someone@isp.example"))
+
+    def test_unknown_charset_delivered(self):
+        raw = b'From: a@example.net\r\nSubject: x\r\nContent-Type: text/plain; charset="x-unknown"\r\n\r\nhell\xe9\r\n'
+        self.gw.deliver_inbound(raw, ["bob"])
+        self.assertIn("hellé", self.mailbox("bob")[0].to_text())
+
+    def test_po_json_mode_kept(self):
+        path = os.path.join(self.root, "po.json")
+        os.chmod(path, 0o600)
+        admin.set_user(self.po, "bob", email="bob@isp.example", notify=False)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_alias_before_rules(self):
+        self.po.update(lambda cfg: cfg["gateway"]["aliases"].__setitem__("bob", "user"))
+        self.assertEqual(self.gw.local_user("bob@mypost.example"), "user")
+
+    def test_smtp_listener(self):
+        a, b = socket.socketpair()
+        threading.Thread(target=self.gw._smtp_session, args=(b, ("t", 0)), daemon=True).start()
+        f = a.makefile("rb")
+        f.readline()
+        raw = (b"From: Carol <carol@example.net>\r\nTo: ann@isp.example, Sales <sales@mypost.example>, "
+               b"dave@example.net\r\nSubject: hi\r\n\r\nbody\r\n")
+        for cmd in (b"HELO x", b"MAIL FROM:<carol@example.net>", b"RCPT TO:<ann@isp.example>",
+                    b"RCPT TO:<info@company.com>", b"DATA"):
+            a.sendall(cmd + b"\r\n")
+            self.assertTrue(f.readline()[:1] in (b"2", b"3"), cmd)
+        a.sendall(raw + b".\r\n")
+        self.assertEqual(f.readline()[:3], b"250")
+        a.sendall(b"QUIT\r\n")
+        a.close()
+        ann, user = self.mailbox("Smith, Ann"), self.mailbox("user")
+        self.assertEqual((len(ann), len(user)), (1, 1))
+        # her own address and the alias are local, not shown again as "addr at INTERNET"
+        gw_names = [M.text(d) for t, d in ann[0].addr_tlvs if t in (M.TAG_SENT_TO, M.TAG_CC_SENT)]
+        self.assertIn("dave@example.net", gw_names)
+        self.assertFalse({"ann@isp.example", "sales@mypost.example"} & {n.lower() for n in gw_names})
+
+
+class SessionTest(GatewayBase):
+    """Upload over a real Call: internet recipients are accepted for a user with her own smtp
+    when there is no gateway section; for others as before (83)."""
+
+    def upload(self, user, msg):
+        a, b = socket.socketpair()
+        a.settimeout(30)
+        t = threading.Thread(target=lambda: _quiet(Call(Link(b, "t"), self.po, "t").run), daemon=True)
+        t.start()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        buf = bytearray()
+
+        def code():
+            while True:
+                while not buf:
+                    buf.extend(a.recv(65536))
+                c = buf.pop(0)
+                if c != 0x91:
+                    return c
+
+        def read(n):
+            while len(buf) < n:
+                buf.extend(a.recv(65536))
+            out = bytes(buf[:n])
+            del buf[:n]
+            return out
+
+        def lstring(s):
+            x = s.encode("cp850") + b"\0"
+            return bytes([len(x)]) + x
+        a.sendall(b"\x80")
+        self.assertEqual(code(), 0x81)
+        a.sendall(lstring(user))
+        self.assertEqual(code(), 0x8B)
+        a.sendall(lstring("123"))
+        self.assertEqual(code(), 0x82)
+        read(read(1)[0])
+        a.sendall(b"\x82\x84")
+        self.assertEqual(code(), 0x85)
+        a.sendall(struct.pack("<H", len(msg.record)) + msg.record)
+        verdict = code()
+        r = code()
+        if r == 0x86:
+            a.sendall(msg.body)
+            r = code()
+        return verdict, r
+
+    def test_user_smtp_accepts_internet(self):
+        self.configure(gateway=None, ann={"email": "ann@isp.example", "smtp": self.ann_smtp()})
+        msg = compose("Smith, Ann", ["bob@example.com at INTERNET"], "out", "t")
+        self.assertEqual(self.upload("Smith, Ann", msg), (0x82, 0x87))
+        self.assertEqual(len([f for f in os.listdir(os.path.join(self.root, "outbound")) if f.endswith(".json")]), 1)
+
+    def test_no_settings_refused_as_before(self):
+        self.configure(gateway=None, ann={"email": "ann@isp.example", "smtp": self.ann_smtp()})
+        msg = compose("bob", ["carol@example.com at INTERNET"], "out", "t")
+        self.assertEqual(self.upload("bob", msg), (0x83, 0x89))
+
+
+class AdminTest(GatewayBase):
+    def test_set_email_keeps_other_keys(self):
+        self.configure(ann={"fetch": {"protocol": "pop3", "host": "h", "user": "u"}})
+        admin.set_user(self.po, "Smith, Ann", email="ann@isp.example", notify=False)
+        e = self.po.user_entry("Smith, Ann")
+        self.assertEqual((e["email"], e["fetch"]["host"]), ("ann@isp.example", "h"))
+        with self.assertRaises(admin.AdminError):
+            admin.set_user(self.po, "bob", email="ANN@isp.example", notify=False)
+        with self.assertRaises(admin.AdminError):
+            admin.set_user(self.po, "bob", email="not an address", notify=False)
+        admin.set_user(self.po, "Smith, Ann", email="", notify=False)
+        self.assertNotIn("email", self.po.user_entry("Smith, Ann"))
+        admin.set_user(self.po, "bob", email="bob@isp.example", notify=False)
+        self.assertEqual(self.po.user_entry("bob"), {"password": "123", "email": "bob@isp.example"})
+
+    def test_rename_moves_fetch_state_and_aliases(self):
+        gw = {"post_office": "INTERNET", "domain": "mypost.example", "aliases": {"sales": "Smith, Ann"}}
+        self.configure(gateway=gw, ann={"fetch": {"protocol": "pop3", "host": "h", "user": "u"}})
+        from ccmail.fetch import Fetcher
+        fx = Fetcher(self.po)
+        fx.save_state("Smith, Ann", {"account": "pop3://u@h", "uidls": ["a"]})
+        admin.rename_user(self.po, "Smith, Ann", "Jones, Ann", notify=False)
+        self.assertFalse(os.path.exists(fx.state_path("Smith, Ann")))
+        self.assertTrue(os.path.exists(fx.state_path("Jones, Ann")))
+        self.assertEqual(self.gw.local_user("sales@mypost.example"), "Jones, Ann")
+
+
+def _quiet(f):
+    try:
+        f()
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    unittest.main()

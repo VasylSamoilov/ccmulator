@@ -11,8 +11,8 @@ Record forms the client applies (§3):
     delete  Name + Locn DL|DP                   not found -> "No changes made"
 The client refuses a delete of its owner's own entry (error 4), so a deleted user is not sent one.
 """
+import datetime
 import os
-import shutil
 
 from . import ade, directory, limits
 
@@ -103,12 +103,23 @@ def add_user(po, name, password, comments=None, codepage=None, notify=True):
     return _queue(po, [_entry(po, name)], skip=(), full_for=(name,)) if notify else []
 
 
-def set_user(po, name, comments=None, codepage=None, notify=True):
+def set_user(po, name, comments=None, codepage=None, notify=True, email=None):
+    """email: the user's own internet address (gateway From/envelope sender and inbound
+    matching); "" removes it. Other keys of the entry (fetch, smtp, ...) are kept."""
     canon = po.user(name)
     if not canon:
         raise AdminError(f"unknown user {name}")
     if comments is not None and len(comments) > limits.NAME_MAX:
         raise AdminError(f"comments longer than {limits.NAME_MAX} characters")
+    if email:
+        from .gateway import is_internet
+        email = email.strip()
+        if not is_internet(email):
+            raise AdminError(f"{email} is not an internet address (name@domain)")
+        for ocanon, _ in po.users.values():
+            e = po._cfg["users"][ocanon]
+            if ocanon != canon and isinstance(e, dict) and str(e.get("email", "")).strip().lower() == email.lower():
+                raise AdminError(f"{ocanon} already has the address {email}")
 
     def change(cfg):
         entry = cfg["users"][canon]
@@ -124,6 +135,11 @@ def set_user(po, name, comments=None, codepage=None, notify=True):
                 entry["codepage"] = codepage
             else:
                 entry.pop("codepage", None)
+        if email is not None:
+            if email:
+                entry["email"] = email
+            else:
+                entry.pop("email", None)
         cfg["users"][canon] = entry if len(entry) > 1 else entry["password"]
     po.update(change)
     # the client sets Cmts only when the line is non-empty, so a cleared comment stays there
@@ -140,7 +156,52 @@ def set_password(po, name, password):
     po._set_password(canon, password)
 
 
+def _state_paths(po, canon):
+    """Per-user state on disk: (description, path) for what exists."""
+    out = []
+    for label, path in (("waiting mail", os.path.join(po.root, "mail", canon)),
+                        ("delivered mail", os.path.join(po.root, "delivered", canon)),
+                        ("interactive-mode state (folders, drafts)", os.path.join(po.root, "vim", canon)),
+                        ("fetch state", os.path.join(po.root, "fetch", canon + ".json"))):
+        if os.path.exists(path):
+            out.append((label, path))
+    return out
+
+
+def user_state(po, name):
+    """What deleting this user removes, as readable lines (no passwords)."""
+    canon = po.user(name)
+    if not canon:
+        raise AdminError(f"unknown user {name}")
+    entry = po._cfg["users"][canon]
+    entry = entry if isinstance(entry, dict) else {}
+    lines = []
+    n = len(po.pending(canon))
+    if n:
+        lines.append(f"{n} message(s) waiting for delivery")
+    for label, path in _state_paths(po, canon):
+        if label != "waiting mail":
+            lines.append(f"{label}: {os.path.relpath(path, po.root)}")
+    if entry.get("email"):
+        lines.append(f"email address {entry['email']}")
+    for key, what in (("fetch", "fetch account"), ("smtp", "outgoing SMTP account")):
+        acc = entry.get(key)
+        if isinstance(acc, dict):
+            lines.append(f"{what} {acc.get('user', '')}@{acc.get('host', '')} "
+                         f"({acc.get('protocol', acc.get('security', ''))}), settings removed")
+    aliases = [k for k, v in ((po._cfg.get("gateway") or {}).get("aliases") or {}).items()
+               if str(v).strip().lower() == canon.lower()]
+    if aliases:
+        lines.append("gateway aliases removed: " + ", ".join(sorted(aliases)))
+    if po.failed_attempts(canon):
+        lines.append(f"{po.failed_attempts(canon)} failed login attempt(s) recorded")
+    return canon, lines
+
+
 def delete_user(po, name, force=False, notify=True):
+    """Remove the user from po.json (with its fetch/smtp settings and the aliases pointing to it)
+    and move its files (waiting and delivered mail, interactive state, fetch state) into
+    deleted/<user>-<time>/, so nothing is destroyed. force = also with mail waiting."""
     canon = po.user(name)
     if not canon:
         raise AdminError(f"unknown user {name}")
@@ -151,14 +212,24 @@ def delete_user(po, name, force=False, notify=True):
     def change(cfg):
         del cfg["users"][canon]
         cfg.get("failed_attempts", {}).pop(canon, None)
+        aliases = (cfg.get("gateway") or {}).get("aliases")
+        if isinstance(aliases, dict):
+            for k in [k for k, v in aliases.items() if str(v).strip().lower() == canon.lower()]:
+                del aliases[k]
     po.update(change)
-    mail = os.path.join(po.root, "mail", canon)
-    if os.path.isdir(mail):
-        dst = os.path.join(po.root, "deleted", canon)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        if os.path.exists(dst):
-            shutil.rmtree(dst)
-        os.replace(mail, dst)
+    paths = _state_paths(po, canon)
+    if paths:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        dst_root = os.path.join(po.root, "deleted", f"{canon}-{stamp}")
+        os.makedirs(dst_root, exist_ok=True)
+        for label, path in paths:
+            if path.endswith(".json"):
+                os.replace(path, os.path.join(dst_root, "fetch.json"))
+                lock = path + ".lock"
+                if os.path.exists(lock):
+                    os.remove(lock)
+            else:
+                os.replace(path, os.path.join(dst_root, os.path.basename(os.path.dirname(path))))
     if notify:
         # the peer post office needs Addr on a delete: without it the record is "other" (Recv_Other)
         _ade(po, [{"name": canon, "locn": "L", "letter": "L", "delete": True, "addr": po.name}])
@@ -176,11 +247,21 @@ def rename_user(po, old, new, notify=True):
         fails = cfg.get("failed_attempts", {})
         if canon in fails:
             fails[new] = fails.pop(canon)
+        aliases = (cfg.get("gateway") or {}).get("aliases") or {}
+        for k, v in aliases.items():                    # gateway aliases follow the user
+            if str(v).strip().lower() == canon.lower():
+                aliases[k] = new
     po.update(change)
     for top in ("mail", "delivered"):
         src, dst = os.path.join(po.root, top, canon), os.path.join(po.root, top, new)
         if os.path.isdir(src) and not os.path.exists(dst):
             os.replace(src, dst)
+    # the fetch state moves too, or the renamed user's whole account would be fetched again
+    from .fetch import Fetcher
+    fetcher = Fetcher(po, getattr(po, "gateway", None))
+    src, dst = fetcher.state_path(canon), fetcher.state_path(new)
+    if os.path.exists(src) and not os.path.exists(dst):
+        os.replace(src, dst)
     rec = dict(_entry(po, new), name=canon, chng=new)
     if notify:
         _ade(po, [dict(_ade_rec(po, new), name=canon, chng=new)])   # the peer reads Chng: in an update

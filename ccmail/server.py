@@ -7,6 +7,7 @@
     python3 -m ccmail.server show FILE.msg
     python3 -m ccmail.server user add|set|passwd|rename|del|list --data DIR [NAME [NEW]] [...]
     python3 -m ccmail.server po add|set|del|list --data DIR [NAME] [...]
+    python3 -m ccmail.server fetch --data DIR [USER]              fetch internet mail accounts now
 
 TCP is what the DOSBox-X modem (and later a modem bridge) delivers after CONNECT; the
 connection carries the raw serial bytes.
@@ -43,14 +44,19 @@ def handle(conn, addr, po, n, line_bps=None):
 
 
 def serve(args):
+    from .fetch import Fetcher
     po = PostOffice(args.data)
     po.gateway = Gateway(po)
+    po.fetcher = Fetcher(po, po.gateway)
     if po.gateway.enabled:
         if po.gateway.listen:
             threading.Thread(target=po.gateway.serve_smtp, daemon=True).start()
-        if po.gateway.smarthost:
-            threading.Thread(target=po.gateway.run_sender, daemon=True).start()
         log.info("internet gateway: post office %s, domain %s", po.gateway.gw_po, po.gateway.domain)
+        for err in po.gateway.config_errors():
+            log.error("config: %s", err)
+    # always running, cheap when idle: per-user smtp/fetch settings may be added while we run
+    threading.Thread(target=po.gateway.run_sender, daemon=True).start()
+    threading.Thread(target=po.fetcher.run, daemon=True).start()
     counter = iter(range(1, 1 << 30))
 
     def listen(port):
@@ -206,7 +212,7 @@ def user_cmd(args):
                 sys.exit("--password is required")
             q = admin.add_user(po, args.name, args.password, args.comments, args.codepage, notify)
         elif args.action == "set":
-            q = admin.set_user(po, args.name, args.comments, args.codepage, notify)
+            q = admin.set_user(po, args.name, args.comments, args.codepage, notify, email=args.email)
         elif args.action == "passwd":
             if not args.password:
                 sys.exit("--password is required")
@@ -218,7 +224,17 @@ def user_cmd(args):
                 sys.exit("rename needs the new name")
             q = admin.rename_user(po, args.name, args.new, notify)
         elif args.action == "del":
-            q = admin.delete_user(po, args.name, args.force, notify)
+            canon, lines = admin.user_state(po, args.name)
+            print(f"Deleting user {canon} removes:")
+            for line in lines or ["(no mail or other state)"]:
+                print("  - " + line)
+            print("Its files are moved to deleted/ in the data directory, not destroyed.")
+            if not (args.yes or args.force):
+                if not sys.stdin.isatty():
+                    sys.exit("not deleted: confirm with --yes")
+                if input(f"Delete {canon}? [y/N] ").strip().lower() not in ("y", "yes"):
+                    sys.exit("not deleted")
+            q = admin.delete_user(po, canon, True, notify)
     except admin.AdminError as e:
         sys.exit(str(e))
     print(f"{args.action}: done")
@@ -251,6 +267,40 @@ def po_cmd(args):
         sys.exit(str(e))
     print(f"{args.action}: done")
     _report(q, notify)
+
+
+def fetch_cmd(args):
+    """Fetch the users' internet mail accounts now (ccmail/fetch.py); print what was taken."""
+    import imaplib
+    import poplib
+    import ssl
+    from .fetch import Fetcher, FetchError
+    from .gateway import ConfigError
+    po = _admin_po(args)
+    fetcher = Fetcher(po, po.gateway)
+    users = [args.user] if args.user else fetcher.users()
+    if args.user and not po.user(args.user):
+        sys.exit(f"unknown user {args.user}")
+    if not users:
+        sys.exit('no user has a "fetch" entry in po.json')
+    failed = False
+    for user in users:
+        user = po.user(user)
+        try:
+            taken = fetcher.fetch_user(user)
+        except ConfigError as e:
+            print(f"{user}: configuration: {e}")
+            failed = True
+            continue
+        except (FetchError, OSError, poplib.error_proto, imaplib.IMAP4.error, ssl.SSLError) as e:
+            print(f"{user}: failed: {type(e).__name__}: {e}")
+            failed = True
+            continue
+        print(f"{user}: {len(taken)} new message(s)")
+        for t in taken:
+            print(f"  from {t['author']}: {t['subject']!r}")
+    if failed:
+        sys.exit(1)
 
 
 def unlock(args):
@@ -314,7 +364,9 @@ def main():
     s.add_argument("--password")
     s.add_argument("--comments", help="directory comment (empty string clears it here)")
     s.add_argument("--codepage", help="DOS code page of the user's PC (e.g. 866); empty clears it")
-    s.add_argument("--force", action="store_true", help="del: even with mail waiting")
+    s.add_argument("--email", help="set: the user's own internet address (From, inbound); empty clears it")
+    s.add_argument("--force", action="store_true", help="del: same as --yes (kept for scripts)")
+    s.add_argument("--yes", action="store_true", help="del: do not ask for confirmation")
     s.add_argument("--no-update", action="store_true", help="do not queue directory updates")
     s.set_defaults(func=user_cmd)
     s = sub.add_parser("po", help="address book: add, set, del, list other post offices")
@@ -334,6 +386,10 @@ def main():
     s.add_argument("po", nargs="?")
     s.add_argument("--all", action="store_true", help="request: ask for its whole directory (/directory)")
     s.set_defaults(func=ade_cmd)
+    s = sub.add_parser("fetch", help="fetch the users' POP3/IMAP accounts now (po.json \"fetch\")")
+    s.add_argument("--data", required=True)
+    s.add_argument("user", nargs="?", help="only this user (default: every user with \"fetch\")")
+    s.set_defaults(func=fetch_cmd)
     s = sub.add_parser("unlock")
     s.add_argument("--data", required=True)
     s.add_argument("user")

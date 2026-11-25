@@ -4,6 +4,9 @@
 
 Layout under the data directory:
     po.json                      {"post_office": "MYPOST", "users": {"user": "123", ...}}
+                                 (a user may be {"password":, "codepage":, "comments":, "email":,
+                                 "smtp":, "fetch":}; gateway.py, fetch.py)
+    fetch/<user>.json            what fetch.py took from the user's POP3/IMAP account
     mail/<user>/<id>.msg         message waiting for delivery (Message.to_file form)
     mail/<user>/<id>.txt         readable copy
     received/<id>.msg/.txt       every message accepted from a client, as received
@@ -18,6 +21,8 @@ import threading
 from .message import Message
 
 _lock = threading.Lock()
+_id_lock = threading.Lock()
+_last_id = ""
 
 
 class PostOffice:
@@ -67,10 +72,19 @@ class PostOffice:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
                 f.write("\n")
+            # keep the file's permissions (po.json holds passwords, e.g. chmod 600)
+            os.chmod(tmp, os.stat(self._path).st_mode & 0o7777)
             os.replace(tmp, self._path)
             self._mtime = os.stat(self._path).st_mtime_ns
             self._apply(cfg)
             return result
+
+    def user_entry(self, user) -> dict:
+        """The user's po.json entry as a dict ({} for the "name": "password" form or an unknown
+        user). Optional per-user internet settings live here: "email", "fetch", "smtp"."""
+        canon = self.user(user or "")
+        entry = self._cfg["users"].get(canon) if canon else None
+        return entry if isinstance(entry, dict) else {}
 
     def user_codepage(self, user):
         from . import codepage
@@ -227,7 +241,17 @@ class PostOffice:
 
     @staticmethod
     def _new_id():
-        return datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        """Time-stamp id, unique within this process: the SMTP listener, the fetch poller and the
+        calls deposit from different threads, and two equal ids would overwrite a message."""
+        global _last_id
+        with _id_lock:
+            now = datetime.datetime.now()
+            mid = now.strftime("%Y%m%d-%H%M%S-%f")
+            while mid <= _last_id:
+                now += datetime.timedelta(microseconds=1)
+                mid = now.strftime("%Y%m%d-%H%M%S-%f")
+            _last_id = mid
+            return mid
 
     def _write(self, folder, mid, msg: Message):
         os.makedirs(folder, exist_ok=True)

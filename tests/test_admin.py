@@ -79,7 +79,41 @@ class AdminTest(unittest.TestCase):
         with self.assertRaises(admin.AdminError):
             admin.delete_user(self.po, "temp", notify=False)
         admin.delete_user(self.po, "temp", force=True, notify=False)
-        self.assertTrue(os.path.isdir(os.path.join(WORK, "deleted", "temp")))
+        moved = [d for d in os.listdir(os.path.join(WORK, "deleted")) if d.startswith("temp-")]
+        self.assertEqual(len(moved), 1)
+        self.assertTrue(os.listdir(os.path.join(WORK, "deleted", moved[0], "mail")))
+
+    def test_delete_moves_all_state_and_settings(self):
+        admin.add_user(self.po, "temp", "pw", notify=False)
+
+        def change(cfg):
+            cfg["users"]["temp"] = {"password": "pw", "email": "temp@example.org",
+                                    "fetch": {"protocol": "imaps", "host": "imap.example.org",
+                                              "user": "temp", "password": "secret"}}
+            cfg["gateway"] = {"post_office": "INTERNET", "aliases": {"sales": "temp", "info": "user"}}
+        self.po.update(change)
+        os.makedirs(os.path.join(WORK, "fetch"))
+        with open(os.path.join(WORK, "fetch", "temp.json"), "w") as f:
+            f.write("{}")
+        open(os.path.join(WORK, "fetch", "temp.json.lock"), "w").close()
+        os.makedirs(os.path.join(WORK, "vim", "temp"))
+        canon, lines = admin.user_state(self.po, "temp")
+        text = "\n".join(lines)
+        self.assertIn("fetch state", text)
+        self.assertIn("temp@imap.example.org", text)
+        self.assertIn("gateway aliases removed: sales", text)
+        self.assertNotIn("secret", text)                       # never shows a password
+        admin.delete_user(self.po, "temp", notify=False)
+        with open(os.path.join(WORK, "po.json")) as f:
+            cfg = json.load(f)
+        self.assertNotIn("temp", cfg["users"])
+        self.assertEqual(cfg["gateway"]["aliases"], {"info": "user"})
+        self.assertFalse(os.path.exists(os.path.join(WORK, "fetch", "temp.json")))
+        self.assertFalse(os.path.exists(os.path.join(WORK, "fetch", "temp.json.lock")))
+        self.assertFalse(os.path.exists(os.path.join(WORK, "vim", "temp")))
+        moved = os.path.join(WORK, "deleted", os.listdir(os.path.join(WORK, "deleted"))[0])
+        self.assertTrue(os.path.exists(os.path.join(moved, "fetch.json")))
+        self.assertTrue(os.path.isdir(os.path.join(moved, "vim")))
 
     def test_post_office(self):
         admin.add_post_office(self.po, "BRANCH", "secret", connect="127.0.0.1:5004", mode="LSEC")
