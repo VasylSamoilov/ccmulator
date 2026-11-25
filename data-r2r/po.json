@@ -1,0 +1,7 @@
+{
+  "post_office": "OURPO",
+  "users": {"admin": "123", "bob": "123", "alice": "123"},
+  "post_offices": {
+    "MYPOST": {"password": "123", "call_password": "SECRET", "connect": "127.0.0.1:5002", "mode": "LSEC"}
+  }
+}

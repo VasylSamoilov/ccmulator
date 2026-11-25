@@ -1,0 +1,18 @@
+{
+  "post_office": "MYPOST",
+  "users": {
+    "admin": "123",
+    "user": "123",
+    "user1": "123",
+    "user2": "123"
+  },
+  "lock_after": 5,
+  "gateway": {
+    "post_office": "INTERNET",
+    "domain": "mypost.example",
+    "listen": "127.0.0.1:2525",
+    "smarthost": "127.0.0.1:2526",
+    "retry_seconds": 30
+  },
+  "failed_attempts": {}
+}

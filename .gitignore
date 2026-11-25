@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+
+# post office data written at run time: keep only the example configurations (po.json)
+/data-*/*
+!/data-*/po.json
+*.lock
+*.new
+
+# third-party material that must not be distributed: Lotus's CCINTL.TB code page tables
+# (copy it from your own cc:Mail installation), the HP 200LX ROM and ROM disk dumps
+CCINTL.TB
+/tools/lxdump/ROM.BIN
+/tools/lxdump/ROMDISK.IMG
+/tools/lxdump/UPPER.BIN
+/tools/lxdump/D/
+
+# local tool settings
+/emu/rea.env
