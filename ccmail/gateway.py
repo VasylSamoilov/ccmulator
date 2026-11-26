@@ -20,6 +20,8 @@ po.json:
         "verify_tls": true,               # check the smarthost's certificate (starttls/ssl)
         "starttls": false,                # older form of "security": "starttls"
         "username": "", "password": "",
+        "peer_address": "at",             # peer users as Name_at_PO@domain ("at", the cc:Mail
+                                          # gateway form) or Name+PO@domain ("plus")
         "retry_seconds": 3600, "retry_times": 72,   # defaults (smtp-link.md §7)
         "rfc822_header_item": false,      # attach the header as RFC822.TXT (needs file items)
         "aliases": {"sales": "Smith, Ann", "info@company.com": "user"}   # inbound, before the rules
@@ -29,6 +31,12 @@ po.json:
         "smtp": {"host": "smtp.isp.example", "port": 587, "security": "starttls",
                  "user": "ann@isp.example", "password": "..", "verify_tls": true},
         "fetch": {...}}}                  # ccmail/fetch.py
+
+Inbound recipients at our domain (recipient()): the aliases and users' own "email" first, then
+the exact name rules, then "Name_at_PO" and "Name+PO" (RFC 5233 subaddress): PO = our post office
+-> the local user; PO = a configured or learned (ADE) peer post office -> queued for that post
+office like a local user's mail to it (refused when we have the peer's directory and the name is
+not in it). A "+detail" that names no post office is dropped (bob+lists -> bob).
 
 Precedence: every per-user setting is optional and a user without them is handled as before.
 A user's "email" replaces the generated address (From, envelope sender, inbound matching); a
@@ -60,6 +68,7 @@ log = logging.getLogger("ccmail.gateway")
 IMPORTANCE = {"normal": ("normal", "normal"), "low": ("low", "non-urgent"), "urgent": ("high", "urgent")}
 LINK_VERSION = f"ccMail Link to SMTP R8.10.00 compatible ({PRODUCT})"
 SMTP_SECURITY = ("starttls", "ssl", "none")
+PEER_ADDRESS = ("at", "plus")
 
 
 class ConfigError(Exception):
@@ -141,15 +150,29 @@ def bare_address(name: str) -> str:
     return re.sub(r"\s+", "", s)
 
 
-def local_part(name: str) -> str:
-    """cc:Mail name -> address local part: "_" -> "__", space -> "_" (the SMTP gateway
-    convention lowercases, the POP3/IMAP one keeps case; we keep case, smtp-link.md 7 item 1)."""
+def _escape(name: str) -> str:
     s = re.sub(r"\([^()]*\)", "", name).replace('"', "").strip()
     s = s.replace("_", "__").replace(" ", "_")
-    s = re.sub(r"[^A-Za-z0-9!#$%&'*+/=?^_`{|}~.,-]", "", s)
+    return re.sub(r"[^A-Za-z0-9!#$%&'*+/=?^_`{|}~.,-]", "", s)
+
+
+def unescape(s: str) -> str:
+    """Local part text -> cc:Mail text: "__" -> "_", "_" -> space (inverse of local_part)."""
+    return s.replace("__", "\0").replace("_", " ").replace("\0", "_")
+
+
+def local_part(name: str, po: str = "", sep: str = "_at_") -> str:
+    """cc:Mail name -> address local part: "_" -> "__", space -> "_" (the SMTP gateway
+    convention lowercases, the POP3/IMAP one keeps case; we keep case, smtp-link.md 7 item 1).
+    With po: Name_at_PO (the cc:Mail gateway form, smtp-link.md §2.2 steps 5-6: made from
+    "name at PO", so "Kit Walker (ACME)" gives Kit_Walker__at_PO) or, sep "+", Name+PO."""
+    if po and sep == "_at_":
+        s = _escape(f"{name} at {po}")
+    else:
+        s = (_escape(name) or "unknown") + (sep + _escape(po) if po else "")
     if "," in s:
         s = '"' + s + '"'                        # specials quoted, e.g. "Last,_First"
-    return s or "unknown"
+    return s
 
 
 class Gateway:
@@ -163,6 +186,7 @@ class Gateway:
         self.starttls = cfg.get("starttls", False)
         self.security = str(cfg.get("security") or ("starttls" if self.starttls else "none")).lower()
         self.verify_tls = bool(cfg.get("verify_tls", True))
+        self.peer_address = str(cfg.get("peer_address", "at")).lower()
         self.username = cfg.get("username", "")
         self.password = cfg.get("password", "")
         self.retry_seconds = cfg.get("retry_seconds", 3600)
@@ -222,6 +246,8 @@ class Gateway:
             self.smarthost_security()
         except ConfigError as x:
             out.append(str(x))
+        if self.peer_address not in PEER_ADDRESS:
+            out.append(f'gateway "peer_address" must be one of {", ".join(PEER_ADDRESS)} (using "at")')
         for canon, e in self._user_entries():
             if e.get("smtp"):
                 try:
@@ -268,7 +294,8 @@ class Gateway:
             return bare_address(name)
         lp = local_part(name)
         if path and path[-1].strip().lower() != self.po.name.lower():
-            lp = local_part(f"{name} at {path[-1].strip()}")    # Name_at_PO (Kit_Walker__at_PO)
+            # Name_at_PO, the cc:Mail gateway form (Kit_Walker_at_PO2), or Name+PO by choice
+            lp = local_part(name, path[-1].strip(), "+" if self.peer_address == "plus" else "_at_")
         return f"{lp}@{self.domain}"
 
     def sender_address(self, msg: M.Message):
@@ -497,38 +524,125 @@ class Gateway:
     # ----- internet -> cc:Mail -----
 
     def local_user(self, address: str):
-        """Recipient address -> post office user. First ours: gateway "aliases" (full address,
-        then the local part when the domain is ours), a user's own "email" (any domain). Then
-        the gateway's rules (smtp-link.md §3.3, Smart Addressing): exact name, "_"/"." as space,
-        Name_at_PO for our post office, postmaster/root -> administrator."""
+        """Recipient address -> post office user of ours, or None (see recipient())."""
+        r = self.recipient(address)
+        return r[1] if r and r[0] == "local" else None
+
+    def recipient(self, address: str):
+        """Recipient address -> ("local", user), ("peer", name, post office, route) or None.
+        First ours: gateway "aliases" (full address, then the local part when the domain is
+        ours), a user's own "email" (any domain). Then the gateway's rules (smtp-link.md §3.3,
+        Smart Addressing): exact name, "_"/"." as space, postmaster/root -> administrator; then
+        Name_at_PO and Name+PO (RFC 5233 subaddress) for our post office and peer post offices.
+        A "+detail" that is not a post office name is dropped (Ann_Smith+news -> Ann)."""
         addr = email.utils.parseaddr(address)[1]
         if "@" not in addr:
             return None
         local, dom = addr.rsplit("@", 1)
         ours = dom.lower() == self.domain.lower()
+        local = local.strip('"')
+        base, plus, detail = local.partition("+")
+        # a "+detail" naming a post office is an address there, never an alias of the base
+        plus_po = bool(plus) and (self._is_own_po(unescape(detail)) or self._peer_po(unescape(detail)))
         aliases = self.aliases
-        for key in (addr.lower(),) + ((local.strip('"').lower(),) if ours else ()):
+        keys = [addr.lower()]
+        if ours:
+            keys.append(local.lower())
+            if plus and not plus_po:
+                keys.append(base.lower())
+        for key in keys:
             if key in aliases:
                 u = self.po.user(aliases[key])
                 if u:
-                    return u
+                    return ("local", u)
                 log.warning("gateway alias %s -> %r: no such user", key, aliases[key])
+        own = {addr.lower()}
+        if plus and not plus_po and base:
+            own.add(f"{base}@{dom}".lower())                        # her own address + detail
         for canon, e in self._user_entries():
-            if (e.get("email") or e.get("smtp")) and (self.user_email(canon)[0] or "").lower() == addr.lower():
-                return canon
+            if (e.get("email") or e.get("smtp")) and (self.user_email(canon)[0] or "").lower() in own:
+                return ("local", canon)
         if not ours:
             return None
-        local = local.strip('"')
-        m = re.fullmatch(r"(.+?)_at_(.+)", local, re.I)
-        if m and m.group(2).replace("_", " ").lower() == self.po.name.lower():
-            local = m.group(1)
+        r = self._resolve_local(local)
+        if r or not plus:
+            return r
+        if plus_po:
+            po = unescape(detail)
+            if self._is_own_po(po):
+                u = self._match_local(base)
+                return ("local", u) if u else None
+            return self._peer_user(base, po)
+        return self._resolve_local(base) if base else None       # subaddress: detail dropped
+
+    def _resolve_local(self, local):
+        """Local part at our domain without subaddress handling: the exact name rules, then
+        Name_at_PO, split at the last "_at_" (Kit_Walker__at_PO, from "Kit Walker (ACME) at
+        PO", leaves "Kit_Walker_": unescaped and stripped, "Kit Walker")."""
+        u = self._match_local(local)
+        if u:
+            return ("local", u)
+        i = local.lower().rfind("_at_")
+        if i > 0:
+            name, po = local[:i], unescape(local[i + 4:])
+            if self._is_own_po(po):
+                u = self._match_local(name)
+                return ("local", u) if u else None
+            if self._peer_po(po):
+                return self._peer_user(name, po)
+        return None
+
+    def _is_own_po(self, name):
+        return name.strip().lower() == self.po.name.lower()
+
+    def _peer_po(self, name):
+        """(post office name, route) of a configured or learned (ADE) post office, or None."""
+        from . import ade
+        if not name.strip():
+            return None
+        configured = self.po.post_office(name)
+        if configured:
+            return configured, configured
+        e = ade.lookup(self.po, name)
+        if e and e.get("locn") == "P":
+            route = ade.po_route(self.po, name)
+            if route:
+                return e["name"], route
+        return None
+
+    @staticmethod
+    def _candidates(local):
+        return list(dict.fromkeys((local, unescape(local), local.replace(".", " "))))
+
+    def _match_local(self, local):
         if local.lower() in ("postmaster", "root", "administrator"):
             return self.po.admin_mailbox
-        for cand in (local, local.replace("__", "\0").replace("_", " ").replace("\0", "_"),
-                     local.replace(".", " ")):
+        for cand in self._candidates(local):
             u = self.po.user(cand)
             if u:
                 return u
+        return None
+
+    def _peer_user(self, local, po_text):
+        """("peer", name, post office, route) for a user of a peer post office. With directory
+        entries learned from that post office the name must be one of them; without, the peer
+        post office decides (as for a local user's mail to "name at PO")."""
+        from . import ade
+        found = self._peer_po(po_text)
+        if not found or not local:
+            return None
+        po, route = found
+
+        def home(e):
+            return (e.get("addr") or e.get("via") or "").split(" ")[0].lower()
+        known = [e for e in ade.entries(self.po) if e.get("locn") != "P" and home(e) == po.lower()]
+        if not known:
+            name = unescape(local).strip()
+            return ("peer", name, po, route) if name and " at " not in name.lower() else None
+        for cand in self._candidates(local):
+            e = ade.lookup(self.po, cand)
+            if e and e.get("locn") != "P" and home(e) == po.lower():
+                return ("peer", e["name"], po, route)
         return None
 
     def from_email(self, raw: bytes, rcpt_users, codepage=None):
@@ -632,9 +746,9 @@ class Gateway:
                     mail_from = cmd[5:].strip()
                     reply("250 OK")
                 elif verb == "RCPT":
-                    user = self.local_user(cmd[8:].strip().strip("<>"))
-                    if user:
-                        rcpts.append(user)
+                    r = self.recipient(cmd[8:].strip().strip("<>"))
+                    if r:
+                        rcpts.append(r)
                         reply("250 OK")
                     else:
                         reply("550 no such user here")
@@ -642,6 +756,8 @@ class Gateway:
                     if not rcpts:
                         reply("503 need RCPT")
                         continue
+                    users = [r[1] for r in rcpts if r[0] == "local"]
+                    peers = [r[1:] for r in rcpts if r[0] == "peer"]
                     reply("354 end with .")
                     data = bytearray()
                     while True:
@@ -653,7 +769,7 @@ class Gateway:
                     if hops > 30:
                         reply("554 too many hops (mail loop)")         # loop guard
                     else:
-                        self.deliver_inbound(bytes(data), rcpts,
+                        self.deliver_inbound(bytes(data), users, peers=peers,
                                              source=f"SMTP from {addr[0]}, {mail_from or 'MAIL FROM:<>'}")
                         reply("250 queued for cc:Mail")
                     rcpts = []
@@ -672,26 +788,44 @@ class Gateway:
         finally:
             conn.close()
 
-    def deliver_inbound(self, raw: bytes, users, source=None):
-        """Convert and deposit for each user. source = where it came from (SMTP peer, fetch
-        account), used in the notice when the mail cannot be converted. The raw mail is kept as
-        inbound/<id>.eml either way."""
+    def deliver_inbound(self, raw: bytes, users, source=None, peers=()):
+        """Convert and deposit for each user; peers = (name, post office, route) of users of
+        other post offices: one copy, addressed "name at PO" like the directory, queued for the
+        route post office as a local user's mail to them is (po.route). source = where it came
+        from (SMTP peer, fetch account), used in the notice when the mail cannot be converted.
+        The raw mail is kept as inbound/<id>.eml either way."""
         users = list(dict.fromkeys(users))
+        peers = list(dict.fromkeys(tuple(p) for p in peers))
+        # local recipients first: for_recipient() takes the first matching 03 entry
+        names = users + [f"{n} at {p}" for n, p, _ in peers]
         os.makedirs(self.inbox_log, exist_ok=True)
         mid = self.po._new_id()
         eml = os.path.join(self.inbox_log, mid + ".eml")
+        kept = os.path.relpath(eml, self.po.root)
         with open(eml, "wb") as f:
             f.write(raw)
         msg = None
         for u in users:                     # each recipient gets the text in its own code page
             cp = self.po.user_codepage(u)
             try:
-                msg = self.from_email(raw, users, codepage=cp)
+                msg = self.from_email(raw, names, codepage=cp)
             except Exception as e:          # noqa: BLE001 - any failure: tell the user, keep the raw mail
                 log.exception("inbound %s for %s cannot be converted", mid, u)
-                msg = self.unconvertible_notice(raw, u, e, source, os.path.relpath(eml, self.po.root), cp)
+                msg = self.unconvertible_notice(raw, u, e, source, kept, cp)
             self.po.deposit(u, msg)
-        log.info("inbound %s from %r for %s: %r", mid, msg.author, ", ".join(users), msg.subject)
+        if peers:
+            cp = self.po.codepage
+            try:
+                copies = [(self.from_email(raw, names, codepage=cp), sorted({r for _, _, r in peers}))]
+            except Exception as e:          # noqa: BLE001
+                log.exception("inbound %s for peer users cannot be converted", mid)
+                copies = [(self.unconvertible_notice(raw, f"{n} at {p}", e, source, kept, cp), [r])
+                          for n, p, r in peers]
+            for m, routes in copies:
+                for r in routes:
+                    self.po.route(r, m)
+                msg = m
+        log.info("inbound %s from %r for %s: %r", mid, msg.author, ", ".join(names), msg.subject)
         return msg
 
     def unconvertible_notice(self, raw, user, error, source, kept, codepage):

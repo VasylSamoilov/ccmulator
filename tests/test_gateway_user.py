@@ -2,10 +2,10 @@
 # Copyright 2026 Vasyl Samoilov
 """Gateway: per-user email address, per-user outgoing SMTP, aliases, the precedence rule (a user
 without settings behaves as before; user settings win; no fallback to the smarthost), the MIME
-part layout of smtp-link.md §2.4 and the product name; smarthost TLS. Fake SMTP servers on
-localhost threads (TLS with a self-signed certificate made at test time, if openssl is
-installed), no network. Data in a scratch directory (CCMAIL_TEST_DIR, else the system temp
-directory)."""
+part layout of smtp-link.md §2.4 and the product name; inbound mail for peer post office users
+and subaddresses; smarthost TLS. Fake SMTP servers on localhost threads (TLS with a self-signed
+certificate made at test time, if openssl is installed), no network. Data in a scratch directory
+(CCMAIL_TEST_DIR, else the system temp directory)."""
 import base64
 import email
 import email.policy
@@ -21,7 +21,7 @@ import threading
 import unittest
 from unittest import mock
 
-from ccmail import PRODUCT, admin
+from ccmail import PRODUCT, admin, ade
 from ccmail import message as M
 from ccmail.gateway import Gateway
 from ccmail.link import Link
@@ -158,9 +158,11 @@ class GatewayBase(unittest.TestCase):
         self.addCleanup(self.smarthost.close)
         self.addCleanup(self.own.close)
 
-    def configure(self, gateway="default", **users):
+    def configure(self, gateway="default", post_offices=None, **users):
         conf = {"post_office": "MYPOST", "codepage": 437,
                 "users": {"Smith, Ann": "123", "bob": "123", "user": "123", "admin": "123"}}
+        if post_offices:
+            conf["post_offices"] = post_offices
         if gateway == "default":
             gateway = {"post_office": "INTERNET", "domain": "mypost.example",
                        "smarthost": f"127.0.0.1:{self.smarthost.port}", "retry_seconds": 0, "retry_times": 2}
@@ -397,6 +399,189 @@ class InboundTest(GatewayBase):
         gw_names = [M.text(d) for t, d in ann[0].addr_tlvs if t in (M.TAG_SENT_TO, M.TAG_CC_SENT)]
         self.assertIn("dave@example.net", gw_names)
         self.assertFalse({"ann@isp.example", "sales@mypost.example"} & {n.lower() for n in gw_names})
+
+
+class PeerInboundTest(GatewayBase):
+    """Inbound mail for users of peer post offices (Name_at_PO, Name+PO), subaddressing for our
+    own users, and the peer address form outbound."""
+
+    def setUp(self):
+        super().setUp()
+        self.gw_cfg = {"post_office": "INTERNET", "domain": "mypost.example",
+                       "smarthost": f"127.0.0.1:{self.smarthost.port}", "retry_seconds": 0,
+                       "aliases": {"sales": "Smith, Ann"}}
+        pos = {"BRANCH": {"password": "x"}, "WEST_HUB": {"password": "x"}, "EAST-1": {"password": "x"}}
+        self.configure(gateway=self.gw_cfg, post_offices=pos)
+
+    def learn(self, *entries):
+        """ADE directory entries as learned from a partner: (name, locn, addr, via)."""
+        def change(state):
+            for name, locn, addr, via in entries:
+                state["entries"][name.lower()] = {"name": name, "locn": locn, "addr": addr, "cmts": "",
+                                                  "via": via}
+        ade.update(self.po, change)
+
+    def rcpt(self, local):
+        return self.gw.recipient(f"{local}@mypost.example")
+
+    def smtp(self, *rcpts, raw=b"From: Carol <carol@example.net>\r\nSubject: hi\r\n\r\nbody\r\n"):
+        """One SMTP transaction to our listener: the RCPT reply codes."""
+        a, b = socket.socketpair()
+        threading.Thread(target=self.gw._smtp_session, args=(b, ("t", 0)), daemon=True).start()
+        f = a.makefile("rb")
+        f.readline()
+        codes = []
+        for cmd in [b"HELO x", b"MAIL FROM:<carol@example.net>"] + [b"RCPT TO:<%s>" % r.encode() for r in rcpts]:
+            a.sendall(cmd + b"\r\n")
+            codes.append(f.readline()[:3].decode())
+        codes = codes[2:]
+        if "250" in codes:
+            a.sendall(b"DATA\r\n")
+            self.assertEqual(f.readline()[:3], b"354")
+            a.sendall(raw + b".\r\n")
+            self.assertEqual(f.readline()[:3], b"250")
+        a.sendall(b"QUIT\r\n")
+        f.readline()
+        a.close()
+        return codes
+
+    def sent_copy(self, po):
+        """What the call to po would send (session.py: routed() + for_post_office())."""
+        out = [m.for_post_office(po, self.po.name) for _, m in self.po.routed(po)]
+        return [m for m in out if m is not None]
+
+    @staticmethod
+    def pending_to(msg):
+        """(name, 0F run) of each pending 03 entry."""
+        tl, out = list(msg.addr_tlvs), []
+        for i, (t, d) in enumerate(tl):
+            if t == M.TAG_TO:
+                run, j = [], i + 1
+                while j < len(tl) and tl[j][0] == M.TAG_PATH:
+                    run.append(M.text(tl[j][1]))
+                    j += 1
+                out.append((M.text(d), run))
+        return out
+
+    def test_peer_user_at_form(self):
+        self.assertEqual(self.rcpt("Kit_Walker_at_BRANCH"), ("peer", "Kit Walker", "BRANCH", "BRANCH"))
+        self.assertEqual(self.rcpt("kit_walker_at_branch"), ("peer", "kit walker", "BRANCH", "BRANCH"))
+        self.assertIsNone(self.rcpt("Kit_Walker_at_NOWHERE"))           # unknown post office: 550
+        self.assertEqual(self.rcpt("bob_at_MYPOST"), ("local", "bob"))  # our own post office
+        self.assertIsNone(self.rcpt("nobody_at_MYPOST"))
+        self.assertEqual(self.rcpt("Kit_at_WEST__HUB"), ("peer", "Kit", "WEST_HUB", "WEST_HUB"))
+        self.assertEqual(self.rcpt("Kit_at_EAST-1"), ("peer", "Kit", "EAST-1", "EAST-1"))
+
+    def test_peer_user_plus_form(self):
+        self.assertEqual(self.rcpt("Kit_Walker+BRANCH"), ("peer", "Kit Walker", "BRANCH", "BRANCH"))
+        self.assertEqual(self.rcpt("Kit+WEST__HUB"), ("peer", "Kit", "WEST_HUB", "WEST_HUB"))
+        self.assertEqual(self.rcpt("bob+MYPOST"), ("local", "bob"))
+        # a post office detail wins over our own user of that name; no silent fallback
+        self.assertEqual(self.rcpt("bob+BRANCH"), ("peer", "bob", "BRANCH", "BRANCH"))
+        self.assertIsNone(self.rcpt("+BRANCH"))
+
+    def test_subaddress_local(self):
+        self.assertEqual(self.rcpt("bob+lists"), ("local", "bob"))
+        self.assertEqual(self.rcpt('"Smith,_Ann+news"'), ("local", "Smith, Ann"))
+        self.assertEqual(self.rcpt("Ann_Smith+anything"), ("local", "Smith, Ann"))
+        self.assertEqual(self.rcpt("sales+promo"), ("local", "Smith, Ann"))    # alias of the base
+        self.assertEqual(self.rcpt("postmaster+x"), ("local", "admin"))
+        self.assertIsNone(self.rcpt("nobody+lists"))
+        self.assertEqual(self.rcpt("bob_at_MYPOST+x"), ("local", "bob"))
+        self.assertEqual(self.rcpt("Kit_at_BRANCH+x"), ("peer", "Kit", "BRANCH", "BRANCH"))
+
+    def test_subaddress_own_email(self):
+        self.po.update(lambda cfg: cfg["users"].__setitem__("bob", {"password": "1", "email": "rb@isp.example"}))
+        self.assertEqual(self.gw.recipient("rb+news@isp.example"), ("local", "bob"))
+        self.po.update(lambda cfg: cfg["users"].__setitem__("bob", {"password": "1", "email": "rb@mypost.example"}))
+        self.assertEqual(self.rcpt("rb+news"), ("local", "bob"))
+        self.assertEqual(self.rcpt("rb+BRANCH"), ("peer", "rb", "BRANCH", "BRANCH"))   # a post office wins
+
+    def test_user_with_plus_in_name(self):
+        self.po.update(lambda cfg: cfg["users"].__setitem__("A+B", "123"))
+        self.assertEqual(self.rcpt("A+B"), ("local", "A+B"))              # the exact name first
+
+    def test_peer_directory_known(self):
+        """With entries learned from BRANCH the name must be one of them; the stored spelling wins."""
+        self.learn(("Walker, Kit", "L", "BRANCH", "BRANCH"))
+        self.assertEqual(self.rcpt('"walker,_kit_at_BRANCH"'), ("peer", "Walker, Kit", "BRANCH", "BRANCH"))
+        self.assertEqual(self.rcpt('"Walker,_Kit+BRANCH"'), ("peer", "Walker, Kit", "BRANCH", "BRANCH"))
+        self.assertIsNone(self.rcpt("Somebody_Else_at_BRANCH"))
+        self.assertIsNotNone(self.rcpt("Somebody_Else_at_EAST-1"))       # nothing learned from EAST-1
+
+    def test_learned_post_office(self):
+        """A post office known only through directory exchange: queued for the partner that
+        reaches it, with the next hop added to the route (ade.add_routes)."""
+        self.learn(("FARAWAY", "P", "BRANCH", "BRANCH"), ("Kit Walker", "L", "FARAWAY", "BRANCH"))
+        self.assertEqual(self.rcpt("Kit_Walker_at_FARAWAY"), ("peer", "Kit Walker", "FARAWAY", "BRANCH"))
+        self.assertEqual(self.smtp("Kit_Walker+FARAWAY@mypost.example"), ["250"])
+        copies = self.sent_copy("BRANCH")
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(self.pending_to(copies[0]), [("Kit Walker", ["FARAWAY", "BRANCH"])])
+
+    def test_round_trip_outbound_inbound(self):
+        """address_of() for a peer user, fed back to RCPT, finds that user again (both forms)."""
+        names = [("Kit Walker", "BRANCH"), ("Walker, Kit", "BRANCH"), ("Kit_Walker", "WEST_HUB"),
+                 ("Kit Walker (ACME)", "EAST-1"), ("J. Doe", "BRANCH")]
+        for mode in ("at", "plus"):
+            self.gw.peer_address = mode
+            for name, po in names:
+                addr = self.gw.address_of(name, [po])
+                self.assertIn("_at_" if mode == "at" else "+", addr)
+                r = self.gw.recipient(addr)
+                want = name.split(" (")[0]
+                self.assertEqual(r, ("peer", want, po, po), (mode, addr))
+        self.gw.peer_address = "at"
+        self.assertEqual(self.gw.address_of("Kit Walker", ["BRANCH"]), "Kit_Walker_at_BRANCH@mypost.example")
+        # made from "name at PO" as before (and as the cc:Mail gateway): the comment leaves "__"
+        self.assertEqual(self.gw.address_of("Kit Walker (ACME)", ["BRANCH"]), "Kit_Walker__at_BRANCH@mypost.example")
+        self.assertEqual(self.gw.address_of("Kit_Walker", ["BRANCH"]), "Kit__Walker_at_BRANCH@mypost.example")
+        self.assertEqual(self.rcpt("Kit_Walker__at_BRANCH"), ("peer", "Kit Walker", "BRANCH", "BRANCH"))
+        self.assertEqual(self.rcpt("Kit__Walker_at_BRANCH"), ("peer", "Kit_Walker", "BRANCH", "BRANCH"))
+        self.assertEqual(self.rcpt("Kit___at_BRANCH"), ("peer", "Kit_", "BRANCH", "BRANCH"))
+        self.assertEqual(self.rcpt("bob__at_MYPOST"), ("local", "bob"))
+        self.gw.peer_address = "plus"
+        self.assertEqual(self.gw.address_of("Kit Walker", ["BRANCH"]), "Kit_Walker+BRANCH@mypost.example")
+        self.assertEqual(self.gw.address_of("Walker, Kit", ["BRANCH"]), '"Walker,_Kit+BRANCH"@mypost.example')
+        self.assertEqual(self.gw.address_of("bob", ["MYPOST"]), "bob@mypost.example")
+
+    def test_peer_address_option_from(self):
+        """From of a peer user's mail through our gateway, in both forms."""
+        for mode, want in (("at", "Kit_Walker_at_BRANCH@mypost.example"),
+                           ("plus", "Kit_Walker+BRANCH@mypost.example")):
+            self.po.update(lambda cfg: cfg["gateway"].__setitem__("peer_address", mode))
+            self.gw = self.po.gateway = Gateway(self.po)
+            msg = compose("Kit Walker", ["x@example.com at INTERNET"], "s", "t", author_po="BRANCH")
+            self.assertEqual(self.gw.to_email(msg, ["x@example.com"])["From"].addresses[0].addr_spec, want)
+        self.po.update(lambda cfg: cfg["gateway"].__setitem__("peer_address", "dots"))
+        self.assertTrue(any("peer_address" in e for e in Gateway(self.po).config_errors()))
+
+    def test_smtp_mixed_local_and_peer(self):
+        codes = self.smtp("bob@mypost.example", "Kit_Walker_at_BRANCH@mypost.example",
+                          "Jo+EAST-1@mypost.example", "nobody_at_BRANCH@mypost.example",
+                          "x_at_NOWHERE@mypost.example", "kit+NOWHERE@mypost.example")
+        # nobody_at_BRANCH: nothing learned from BRANCH, so BRANCH decides; kit+NOWHERE: NOWHERE
+        # is no post office, so it is the subaddress of "kit", who is not ours
+        self.assertEqual(codes, ["250", "250", "250", "250", "550", "550"])
+        bob = self.mailbox("bob")
+        self.assertEqual(len(bob), 1)
+        self.assertEqual(self.pending_to(bob[0]), [("bob", [])])
+        branch = self.sent_copy("BRANCH")
+        self.assertEqual(len(branch), 1)
+        self.assertEqual(self.pending_to(branch[0]), [("Kit Walker", ["BRANCH"]), ("nobody", ["BRANCH"])])
+        self.assertIn("body", branch[0].to_text())
+        self.assertEqual(branch[0].author, "Carol <carol@example.net>")
+        east = self.sent_copy("EAST-1")
+        self.assertEqual([self.pending_to(m) for m in east], [[("Jo", ["EAST-1"])]])
+        self.assertEqual(self.sent_copy("WEST_HUB"), [])
+
+    def test_peer_unconvertible_notice_routed(self):
+        with mock.patch.object(Gateway, "from_email", side_effect=ValueError("broken")):
+            self.gw.deliver_inbound(b"Subject: x\r\n\r\ny\r\n", [], peers=[("Kit", "BRANCH", "BRANCH")])
+        copies = self.sent_copy("BRANCH")
+        self.assertEqual(len(copies), 1)
+        self.assertIn("could not be converted", copies[0].subject)
+        self.assertEqual(self.pending_to(copies[0]), [("Kit", ["BRANCH"])])
 
 
 class SmarthostTLSTest(GatewayBase):

@@ -36,7 +36,9 @@ It does not include, and does not need, any Lotus or HP software.
   answering their calls.
 - **Internet gateway**: SMTP in and out, with the address, header and attachment mapping of
   `spec/smtp-link.md`; gateway aliases (`sales@yourdomain`, or any full address, to a user);
-  a smarthost with STARTTLS or implicit TLS and a checked certificate.
+  inbound mail also for users of peer post offices (`Name_at_PO@` or `Name+PO@`) and to
+  subaddresses (`name+detail@`); a smarthost with STARTTLS or implicit TLS and a checked
+  certificate.
 - **Per-user internet mail**: a user's own email address (From, envelope sender, inbound
   matching), her own outgoing SMTP server (STARTTLS, SSL), and fetching from her own POP3, POP3S,
   IMAP or IMAPS account into her cc:Mail mailbox, polled in the background and at the start of her
@@ -336,6 +338,7 @@ There is no call scheduler yet.
         "post_office": "INTERNET", "domain": "example.org",
         "listen": "127.0.0.1:2525", "smarthost": "127.0.0.1:2526",
         "security": "none", "verify_tls": true, "username": "", "password": "",
+        "peer_address": "at",
         "retry_seconds": 3600, "retry_times": 72,
         "aliases": {"sales": "Smith, Ann", "info@company.com": "user"}
       }
@@ -359,6 +362,7 @@ There is no call scheduler yet.
 | `gateway` | the internet gateway: its `post_office` name in the directory (default `INTERNET`), the mail `domain` of local users (default `localhost`), inbound SMTP `listen` address (none = no listener), outbound `smarthost` (`host:port`), retries every `retry_seconds` (default 3600), `retry_times` (default 72) |
 | gateway `security`, `verify_tls` | the smarthost connection: `none` (default, plain SMTP) \| `starttls` (fails if the relay does not offer it) \| `ssl` (implicit TLS, e.g. port 465); `verify_tls` (default true) checks the relay's certificate and name, as for a user's `smtp`. `"starttls": true` is the older spelling of `"security": "starttls"` |
 | gateway `username`, `password` | AUTH at the smarthost (in clear text with `security` `none`) |
+| gateway `peer_address` | the generated address of a peer post office's user (in the From of her mail through this gateway): `at` (default) = `Name_at_PO@domain`, the form of the cc:Mail SMTP gateway and POP3/IMAP servers; `plus` = `Name+PO@domain` (RFC 5233 subaddress style, an option of this server). Inbound accepts both forms either way |
 | gateway `aliases` | inbound address -> user: a local part (for the gateway `domain` only) or a full address (any domain); case does not matter |
 | user `email` | the user's own internet address: From and envelope sender of the mail she writes, and inbound mail to it (any domain) reaches her |
 | user `smtp` | her own outgoing server: `host`, `port` (default 587, 465 for `ssl`), `security` `starttls` (default) \| `ssl` \| `none`, `user`, `password`, `verify_tls` (default true) |
@@ -379,12 +383,30 @@ user has one, it takes precedence over the shared gateway settings:
 - **Inbound matching**, in this order: gateway `aliases` (full address, then the local part when
   the domain is ours), a user's own `email` (or, without one, her smtp `user` when that is an
   address), then the generated-name rules of the gateway (`spec/smtp-link.md` §3.3: the exact
-  name, `_` or `.` for a space, `First_Last` also for `Last, First`, `Name_at_POSTOFFICE` with
-  our own post office's name; `postmaster`, `root` and `administrator` reach the `admin`
-  mailbox; case does not matter). Users of peer post offices are not reached this way: their
-  `Name_at_BRANCH` addresses are refused. Inbound To/Cc addresses
-  that are local users (also by alias or own
-  address) are not repeated as internet recipients.
+  name, `_` or `.` for a space, `First_Last` also for `Last, First`; `postmaster`, `root` and
+  `administrator` reach the `admin` mailbox; case does not matter), then the post office forms
+  below. Inbound To/Cc addresses that are local users (also by alias or own address) are not
+  repeated as internet recipients.
+- **Post office forms**: `Name_at_PO@domain` and `Name+PO@domain` are both accepted, whatever
+  `peer_address` says. With our own post office's name (`bob_at_MYPOST`, `bob+MYPOST`) they reach
+  the local user. With a peer post office, configured in `post_offices` or learned through
+  directory exchange (`ade`), the message is queued for that post office (`route/<PO>/`;
+  a learned one goes to the partner that reaches it) addressed `Name at PO` as in the directory,
+  exactly like a local user's mail to that user, and goes out at the next call. If directory
+  entries learned from that post office exist, the name must be one of them (any case, `_` or
+  `.` for a space); without them the message is accepted and the peer post office decides (its
+  non-delivery report reaches the internet sender only if that post office routes the gateway
+  post office back to us, see below). An unknown post office or user is refused with 550 at
+  RCPT. `_` in a name is written `__` (`Kit__Walker_at_PO` is "Kit_Walker" at PO); a name with
+  a comma is quoted (`"Walker,_Kit+BRANCH"@example.org`). A comment in parentheses is dropped
+  and leaves its blank, as the cc:Mail gateway writes it: "Kit Walker (ACME)" at PO is
+  `Kit_Walker__at_PO`, which is read back as Kit Walker.
+- **Subaddresses** (RFC 5233, as Postfix and Sendmail use `+`): `Ann_Smith+news@example.org`
+  reaches Ann; a `+detail` that is not a post office name is dropped. An alias takes its
+  subaddresses too (`sales+promo` -> the `sales` alias), and so does a user's own `email`
+  (`ann@isp.example` also takes `ann+news@isp.example`). The exact name is tried first, so a user
+  whose name contains `+` is still found, and a `+detail` that names a peer post office always
+  means that post office (`bob+BRANCH` is bob at BRANCH, never the local bob).
 - **From address**: her `email`; without it, the smtp `user` if that is an address; otherwise the
   generated `Name@domain`. A user with `smtp` but no usable address has her internet mail refused
   at once with a report in her mailbox, and `serve` logs the configuration error at start.
@@ -534,9 +556,16 @@ and `/etc/postfix/transport` (run `postmap /etc/postfix/transport` after editing
   `kit.walker@example.org`. Aliases are for other names (`sales`, `bob`) and, as full
   addresses, for other domains the MTA hands over (`info@company.example`). Ann's own `email`
   reaches her as well. There is no catch-all: an address that matches nothing is refused at RCPT.
-- **Users of peer post offices** cannot be reached through the gateway: an address such as
-  `Kit_Walker_at_BRANCH@example.org` is refused. Only `Name_at_MYPOST` with this post office's
-  own name is understood (it reaches the local user).
+- **Users of peer post offices** (`post_offices`, or learned by directory exchange) are reached
+  as `Kit_Walker_at_BRANCH@example.org` or `Kit_Walker+BRANCH@example.org`: the message waits in
+  `route/BRANCH/` for the next call to BRANCH. Their mail out through this gateway has the From
+  `Kit_Walker_at_BRANCH@example.org` (the cc:Mail gateway form), or
+  `Kit_Walker+BRANCH@example.org` with `"peer_address": "plus"`; replies reach them either way.
+  A reply (or a non-delivery report) from BRANCH back to an internet author
+  (`Carol <carol@x.example> at INTERNET`) needs BRANCH to route the post office `INTERNET` to
+  this post office. Directory exchange sends our users, not that entry, so add `INTERNET` on
+  BRANCH as a post office reached through MYPOST. **Subaddresses** of local users work too:
+  `ann.smith+news@example.org` reaches Ann.
 - **From addresses:** Ann sends from her `email`, `ann.smith@example.org`. Bob, who has no
   `email`, sends from the generated address, which keeps the case, turns spaces into `_` and
   quotes a name with a comma: `"Jones, Bob" <"Jones,_Bob"@example.org>`. Replies to it reach him,
@@ -557,14 +586,32 @@ and `/etc/postfix/transport` (run `postmap /etc/postfix/transport` after editing
   does not offer it, so the password never goes out in clear text. With `security` `none`, a
   `username` and `password` go out in clear text.
 - **The listener** speaks plain SMTP without STARTTLS or AUTH and answers 550 at RCPT for an
-  address it does not know. Postfix as above accepts any address of the domain first and then
-  bounces those; check Postfix's own options for rejecting unknown relay recipients up front.
+  address it does not know. Postfix as above accepts every address of a relay domain (an empty
+  `relay_recipient_maps`, the default, accepts all recipients); the 550 from ccmulator then
+  turns into a bounce from Postfix, and bounces to forged senders are backscatter. To refuse
+  unknown recipients at Postfix's own RCPT, either list the valid addresses in
+  `relay_recipient_maps`, or let Postfix ask ccmulator by address verification:
+
+      smtpd_recipient_restrictions = permit_mynetworks, reject_unauth_destination,
+          reject_unverified_recipient
+      unverified_recipient_reject_code = 550
+
+  A list is hard to keep complete here (aliases, `_`/`.` variants, subaddresses, peer post office
+  users), so verification is the better fit. With `recipient_delimiter = +` a listed
+  `ann.smith@example.org` also admits `ann.smith+news@example.org` (Postfix looks up the address
+  with the extension first, then without), but it also admits `ann.smith+BRANCH@`, which
+  ccmulator reads as a peer address; verification has no such gap.
+- **Exim** instead of Postfix: a `manualroute` router for the domain,
+  `route_list = * 127.0.0.1::2525` with `self = send` and an `smtp` transport, and in the RCPT ACL
+  `require verify = recipient/callout=10s,defer_ok` refuses unknown recipients at RCPT by asking
+  ccmulator first. Mail from ccmulator to the smarthost is relayed when 127.0.0.1 is in
+  `relay_from_hosts`.
 - **Test the inbound side from the command line:** `swaks --server 127.0.0.1 --port 2525 --to
-  sales@example.org --from you@elsewhere.example --body "hello"`, then look in
-  `DIR/mail/Smith, Ann/` (the `.txt` file, or `python3 -m ccmail.server show` on the `.msg`). The
-  original is kept as `DIR/inbound/<id>.eml`. For the outbound side, `python3 tools/smtpsink.py
-  2526 DIR/sink` stands in for the smarthost (`"smarthost": "127.0.0.1:2526"`) and stores each
-  message as an `.eml` file.
+  sales@example.org --from you@elsewhere.example --body "hello"` (or any SMTP client), then look
+  in `DIR/mail/Smith, Ann/` (the `.txt` file, or `python3 -m ccmail.server show` on the `.msg`).
+  The original is kept as `DIR/inbound/<id>.eml`; mail for a peer post office's user waits in
+  `DIR/route/<PO>/`. For the outbound side, `python3 tools/smtpsink.py 2526 DIR/sink` stands in
+  for the smarthost (`"smarthost": "127.0.0.1:2526"`) and stores each message as an `.eml` file.
 
 **3. Both at once.** Most users go through the domain (example 2); a user's own settings take
 precedence where she has them:
