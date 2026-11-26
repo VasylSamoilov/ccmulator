@@ -549,6 +549,13 @@ and `/etc/postfix/transport` (run `postmap /etc/postfix/transport` after editing
 
     example.org    smtp:[127.0.0.1]:2525
 
+This setup, the recipient checks and the smarthost notes below were tested with Postfix 3.10
+(Debian 13). The transport entry also overrides `relay_transport = error` of Debian's "Local
+only" configuration, so mail for the domain reaches ccmulator in either case; but for
+ccmulator's outbound mail Postfix itself must deliver to the internet ("Internet Site", or a
+`relayhost`): with "Local only" (`default_transport = error`) it accepts that mail and then
+bounces it.
+
 - **Addresses that arrive without an alias:** the name rules accept the name with `_` or `.` for
   the space, in any case, and a `Last, First` name also as `First_Last`. So
   `ann.smith@example.org`, `Ann_Smith@example.org` and `bob.jones@example.org` reach Ann and Bob
@@ -577,8 +584,10 @@ and `/etc/postfix/transport` (run `postmap /etc/postfix/transport` after editing
 - **The smarthost on localhost** is plain SMTP (`security` `none`, the default). Postfix relays
   for it without AUTH because 127.0.0.1 is in its `mynetworks` (the default since Postfix 3.0,
   `mynetworks_style = host`). If you set `"security": "starttls"` towards a local MTA whose
-  certificate is self-signed (a distribution's "snakeoil" certificate), the connection now fails
-  on the certificate check: add `"verify_tls": false`, or stay plain on localhost.
+  certificate is self-signed (a distribution's "snakeoil" certificate, made for the host name),
+  the connection fails on the certificate check (`CERTIFICATE_VERIFY_FAILED`, and with
+  `127.0.0.1` also an IP address mismatch) and the message stays queued: add
+  `"verify_tls": false`, or stay plain on localhost.
 - **Without a local MTA:** point `smarthost` (`host:port`, the port is required) at your
   provider's relay: port 587 with `"security": "starttls"`, or 465 with `"security": "ssl"`
   (implicit TLS), plus `"username"` and `"password"`. The relay's certificate and host name are
@@ -596,18 +605,23 @@ and `/etc/postfix/transport` (run `postmap /etc/postfix/transport` after editing
           reject_unverified_recipient
       unverified_recipient_reject_code = 550
 
-  A list is hard to keep complete here (aliases, `_`/`.` variants, subaddresses, peer post office
-  users), so verification is the better fit. With `recipient_delimiter = +` a listed
-  `ann.smith@example.org` also admits `ann.smith+news@example.org` (Postfix looks up the address
-  with the extension first, then without), but it also admits `ann.smith+BRANCH@`, which
-  ccmulator reads as a peer address; verification has no such gap.
+  Postfix then asks ccmulator's listener (a probe that stops at RCPT) and answers `550 5.1.1
+  ... Recipient address rejected: undeliverable address` for an unknown one, in the same
+  session. The check is skipped for clients in `mynetworks`, so test it from outside, not from
+  the machine itself. A list is hard to keep complete here (aliases, `_`/`.` variants,
+  subaddresses, peer post office users), so verification is the better fit. With
+  `recipient_delimiter = +` (Debian's default) a listed `ann.smith@example.org` also admits
+  `ann.smith+news@example.org`, but it also admits `ann.smith+BRANCH@`, which ccmulator reads
+  as a peer address, while an unlisted `Kit_Walker+BRANCH@` is refused ("User unknown in relay
+  recipient table"); verification has no such gaps.
 - **Exim** instead of Postfix: a `manualroute` router for the domain,
   `route_list = * 127.0.0.1::2525` with `self = send` and an `smtp` transport, and in the RCPT ACL
   `require verify = recipient/callout=10s,defer_ok` refuses unknown recipients at RCPT by asking
   ccmulator first. Mail from ccmulator to the smarthost is relayed when 127.0.0.1 is in
   `relay_from_hosts`.
 - **Test the inbound side from the command line:** `swaks --server 127.0.0.1 --port 2525 --to
-  sales@example.org --from you@elsewhere.example --body "hello"` (or any SMTP client), then look
+  sales@example.org --from you@elsewhere.example --body "hello"` (or any SMTP client; use
+  `--port 25` to go through Postfix), then look
   in `DIR/mail/Smith, Ann/` (the `.txt` file, or `python3 -m ccmail.server show` on the `.msg`).
   The original is kept as `DIR/inbound/<id>.eml`; mail for a peer post office's user waits in
   `DIR/route/<PO>/`. For the outbound side, `python3 tools/smtpsink.py 2526 DIR/sink` stands in
