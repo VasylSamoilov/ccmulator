@@ -216,7 +216,7 @@ class Fetcher:
         return t
 
     def run(self, tick=5):
-        """Background poller: each user at her "interval"; po.json changes are picked up."""
+        """Background poller: each user at the user's "interval"; po.json changes are picked up."""
         while True:
             try:
                 self._poll_once()

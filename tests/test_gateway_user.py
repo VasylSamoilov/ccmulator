@@ -356,7 +356,7 @@ class InboundTest(GatewayBase):
         self.assertEqual(lu("<info@company.com>"), "user")
         self.assertEqual(lu("help@company.com"), "bob")             # case-insensitive keys
         self.assertIsNone(lu("sales@other.example"))                # local-part alias: our domain only
-        self.assertEqual(lu("ann@isp.example"), "Smith, Ann")       # her own address, any domain
+        self.assertEqual(lu("ann@isp.example"), "Smith, Ann")       # Ann's own address, any domain
         self.assertEqual(lu("bob@mypost.example"), "bob")           # generated rules still work
         self.assertEqual(lu('"Smith,_Ann"@mypost.example'), "Smith, Ann")
         self.assertEqual(lu("postmaster@mypost.example"), "admin")
@@ -395,7 +395,7 @@ class InboundTest(GatewayBase):
         a.close()
         ann, user = self.mailbox("Smith, Ann"), self.mailbox("user")
         self.assertEqual((len(ann), len(user)), (1, 1))
-        # her own address and the alias are local, not shown again as "addr at INTERNET"
+        # Ann's own address and the alias are local, not shown again as "addr at INTERNET"
         gw_names = [M.text(d) for t, d in ann[0].addr_tlvs if t in (M.TAG_SENT_TO, M.TAG_CC_SENT)]
         self.assertIn("dave@example.net", gw_names)
         self.assertFalse({"ann@isp.example", "sales@mypost.example"} & {n.lower() for n in gw_names})
@@ -670,7 +670,7 @@ class SmarthostTLSTest(GatewayBase):
 
 
 class SessionTest(GatewayBase):
-    """Upload over a real Call: internet recipients are accepted for a user with her own smtp
+    """Upload over a real Call: internet recipients are accepted for a user with their own smtp
     when there is no gateway section; for others as before (83)."""
 
     def upload(self, user, msg):

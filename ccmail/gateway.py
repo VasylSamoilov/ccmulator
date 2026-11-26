@@ -27,7 +27,7 @@ po.json:
         "aliases": {"sales": "Smith, Ann", "info@company.com": "user"}   # inbound, before the rules
     }
     "users": {"Smith, Ann": {"password": "..",
-        "email": "ann@isp.example",       # her From/envelope sender; inbound to it reaches her
+        "email": "ann@isp.example",       # Ann's From/envelope sender; inbound to it reaches Ann
         "smtp": {"host": "smtp.isp.example", "port": 587, "security": "starttls",
                  "user": "ann@isp.example", "password": "..", "verify_tls": true},
         "fetch": {...}}}                  # ccmail/fetch.py
@@ -40,9 +40,9 @@ not in it). A "+detail" that names no post office is dropped (bob+lists -> bob).
 
 Precedence: every per-user setting is optional and a user without them is handled as before.
 A user's "email" replaces the generated address (From, envelope sender, inbound matching); a
-user's "smtp" replaces the shared smarthost for mail she writes, with no fallback to the
-smarthost (failures are retried, then reported to her, as for the smarthost). Per-user settings
-work without "listen"/"smarthost", even without a "gateway" section (post office "INTERNET").
+user's "smtp" replaces the shared smarthost for mail the user writes, with no fallback to the
+smarthost (failures are retried, then reported to the user, as for the smarthost). Per-user
+settings work without "listen"/"smarthost", even without a "gateway" section (post office "INTERNET").
 """
 import datetime
 import email
@@ -205,14 +205,14 @@ class Gateway:
 
     @property
     def enabled(self):
-        """A "gateway" section, or any user with her own email/smtp/fetch settings."""
+        """A "gateway" section, or any user with their own email/smtp/fetch settings."""
         self.po.refresh()
         return bool(self.po._cfg.get("gateway")) or any(
             e.get("email") or e.get("smtp") or e.get("fetch") for _, e in self._user_entries())
 
     def enabled_for(self, user) -> bool:
         """Whether mail from this caller to the internet is accepted: with a "gateway" section
-        as before (queued for the smarthost), else only for a user with her own "smtp"."""
+        as before (queued for the smarthost), else only for a user with their own "smtp"."""
         self.po.refresh()
         return bool(self.po._cfg.get("gateway")) or bool(self.po.user_entry(user).get("smtp"))
 
@@ -224,8 +224,8 @@ class Gateway:
         return {k.strip().lower(): v for k, v in a.items()}
 
     def user_email(self, user):
-        """(address, error) of a local user: her "email"; else her smtp "user" when it is an
-        address; ("", error) when she has "smtp" but neither; (None, None) = generated address."""
+        """(address, error) of a local user: the user's "email"; else the smtp "user" when it is
+        an address; ("", error) with "smtp" but neither; (None, None) = generated address."""
         e = self.po.user_entry(user)
         if e.get("email"):
             return e["email"].strip(), None
@@ -419,7 +419,7 @@ class Gateway:
 
     def _route(self, meta):
         """(open connection function, description) for a queued message. A user route uses only
-        that user's server: ConfigError if her settings are gone or wrong (retried, never sent
+        that user's server: ConfigError if those settings are gone or wrong (retried, never sent
         through the smarthost)."""
         via = meta.get("via")
         if via:
@@ -558,7 +558,7 @@ class Gateway:
                 log.warning("gateway alias %s -> %r: no such user", key, aliases[key])
         own = {addr.lower()}
         if plus and not plus_po and base:
-            own.add(f"{base}@{dom}".lower())                        # her own address + detail
+            own.add(f"{base}@{dom}".lower())                        # user's own address + detail
         for canon, e in self._user_entries():
             if (e.get("email") or e.get("smtp")) and (self.user_email(canon)[0] or "").lower() in own:
                 return ("local", canon)

@@ -40,9 +40,9 @@ It does not include, and does not need, any Lotus or HP software.
   subaddresses (`name+detail@`); a smarthost with STARTTLS or implicit TLS and a checked
   certificate.
 - **Per-user internet mail**: a user's own email address (From, envelope sender, inbound
-  matching), her own outgoing SMTP server (STARTTLS, SSL), and fetching from her own POP3, POP3S,
-  IMAP or IMAPS account into her cc:Mail mailbox, polled in the background and at the start of her
-  call, with persistent state so nothing is fetched twice.
+  matching), the user's own outgoing SMTP server (STARTTLS, SSL), and fetching from the user's own
+  POP3, POP3S, IMAP or IMAPS account into the user's cc:Mail mailbox, polled in the background and
+  at the start of each call, with persistent state so nothing is fetched twice.
 - **HP 200LX interactive mode**: the client browses, reads, files, deletes and sends mail on the
   server during the call.
 - **Post office files**: read, and write (deliver, add users, mark read, delete messages) cc:Mail
@@ -362,11 +362,11 @@ There is no call scheduler yet.
 | `gateway` | the internet gateway: its `post_office` name in the directory (default `INTERNET`), the mail `domain` of local users (default `localhost`), inbound SMTP `listen` address (none = no listener), outbound `smarthost` (`host:port`), retries every `retry_seconds` (default 3600), `retry_times` (default 72) |
 | gateway `security`, `verify_tls` | the smarthost connection: `none` (default, plain SMTP) \| `starttls` (fails if the relay does not offer it) \| `ssl` (implicit TLS, e.g. port 465); `verify_tls` (default true) checks the relay's certificate and name, as for a user's `smtp`. `"starttls": true` is the older spelling of `"security": "starttls"` |
 | gateway `username`, `password` | AUTH at the smarthost (in clear text with `security` `none`) |
-| gateway `peer_address` | the generated address of a peer post office's user (in the From of her mail through this gateway): `at` (default) = `Name_at_PO@domain`, the form of the cc:Mail SMTP gateway and POP3/IMAP servers; `plus` = `Name+PO@domain` (RFC 5233 subaddress style, an option of this server). Inbound accepts both forms either way |
+| gateway `peer_address` | the generated address of a peer post office's user (in the From of that user's mail through this gateway): `at` (default) = `Name_at_PO@domain`, the form of the cc:Mail SMTP gateway and POP3/IMAP servers; `plus` = `Name+PO@domain` (RFC 5233 subaddress style, an option of this server). Inbound accepts both forms either way |
 | gateway `aliases` | inbound address -> user: a local part (for the gateway `domain` only) or a full address (any domain); case does not matter |
-| user `email` | the user's own internet address: From and envelope sender of the mail she writes, and inbound mail to it (any domain) reaches her |
-| user `smtp` | her own outgoing server: `host`, `port` (default 587, 465 for `ssl`), `security` `starttls` (default) \| `ssl` \| `none`, `user`, `password`, `verify_tls` (default true) |
-| user `fetch` | her own mailbox to fetch: `protocol` `pop3` \| `pop3s` \| `imap` \| `imaps`, `host`, `port` (default 110/995, 143/993, by `security`), `security` `ssl` \| `starttls` \| `none` (default `ssl` for pop3s/imaps, else `starttls`), `user`, `password`, `folder` (IMAP, default INBOX), `interval` seconds (default 300, at least 10), `after` `keep` (default) \| `seen` \| `delete`, `verify_tls` (default true) |
+| user `email` | the user's own internet address: From and envelope sender of the mail the user writes, and inbound mail to it (any domain) reaches the user |
+| user `smtp` | the user's own outgoing server: `host`, `port` (default 587, 465 for `ssl`), `security` `starttls` (default) \| `ssl` \| `none`, `user`, `password`, `verify_tls` (default true) |
+| user `fetch` | the user's own mailbox to fetch: `protocol` `pop3` \| `pop3s` \| `imap` \| `imaps`, `host`, `port` (default 110/995, 143/993, by `security`), `security` `ssl` \| `starttls` \| `none` (default `ssl` for pop3s/imaps, else `starttls`), `user`, `password`, `folder` (IMAP, default INBOX), `interval` seconds (default 300, at least 10), `after` `keep` (default) \| `seen` \| `delete`, `verify_tls` (default true) |
 
 `data-test/` and `data-r2r/` are example post offices.
 
@@ -381,7 +381,7 @@ Every per-user setting is optional; a user without them is handled exactly as be
 user has one, it takes precedence over the shared gateway settings:
 
 - **Inbound matching**, in this order: gateway `aliases` (full address, then the local part when
-  the domain is ours), a user's own `email` (or, without one, her smtp `user` when that is an
+  the domain is ours), a user's own `email` (or, without one, the user's smtp `user` when that is an
   address), then the generated-name rules of the gateway (`spec/smtp-link.md` §3.3: the exact
   name, `_` or `.` for a space, `First_Last` also for `Last, First`; `postmaster`, `root` and
   `administrator` reach the `admin` mailbox; case does not matter), then the post office forms
@@ -407,23 +407,24 @@ user has one, it takes precedence over the shared gateway settings:
   (`ann@isp.example` also takes `ann+news@isp.example`). The exact name is tried first, so a user
   whose name contains `+` is still found, and a `+detail` that names a peer post office always
   means that post office (`bob+BRANCH` is bob at BRANCH, never the local bob).
-- **From address**: her `email`; without it, the smtp `user` if that is an address; otherwise the
-  generated `Name@domain`. A user with `smtp` but no usable address has her internet mail refused
-  at once with a report in her mailbox, and `serve` logs the configuration error at start.
-- **Outgoing route**: mail she writes goes only through her own `smtp` server, never through the
-  shared smarthost. The route is fixed when the message is queued (`"via"` in
+- **From address**: the user's `email`; without it, the smtp `user` if that is an address;
+  otherwise the generated `Name@domain`. A user with `smtp` but no usable address has their
+  internet mail refused at once with a report in their mailbox, and `serve` logs the configuration
+  error at start.
+- **Outgoing route**: mail the user writes goes only through the user's own `smtp` server, never
+  through the shared smarthost. The route is fixed when the message is queued (`"via"` in
   `outbound/<id>.json`); a failure is retried (`retry_seconds`, `retry_times`) and then reported
-  to her, a 5xx refusal at once. `starttls` fails if the server does not offer it, so the password
-  never goes out in clear text. Other users keep using the smarthost.
+  to the user, a 5xx refusal at once. `starttls` fails if the server does not offer it, so the
+  password never goes out in clear text. Other users keep using the smarthost.
 - **Without a gateway section**: the per-user settings also work without `listen`, `smarthost`
   or a `gateway` section (post office `INTERNET`, domain `localhost`). Then only users with their
   own `smtp` can send to the internet; others are refused at upload, as without a gateway.
 
-Fetching: messages are converted like inbound SMTP mail (her code page, author
+Fetching: messages are converted like inbound SMTP mail (the user's code page, author
 `Sender <addr> at INTERNET`) and the original is kept in `inbound/`. `serve` polls each account at
-its `interval`, and fetches at the start of the user's call while she uploads; before sending her
-mail it waits at most 10 seconds, keeping the line serviced, then goes on with what is there (the
-rest comes in the next call). HP 200LX interactive calls start the fetch without waiting. `after`:
+its `interval`, and fetches at the start of the user's call during the upload; before sending the
+user's mail it waits at most 10 seconds, keeping the line serviced, then goes on with what is there
+(the rest comes in the next call). HP 200LX interactive calls start the fetch without waiting. `after`:
 `keep` leaves the server untouched (IMAP folders are opened read-only), `seen` sets the IMAP
 \Seen flag (for POP3 the same as keep), `delete` removes the message on the server once stored.
 
@@ -448,7 +449,7 @@ stored message (a `.lock` file next to it allows one fetch per user at a time, a
   the headers are fetched and a message is taken only if its key is unknown, so nothing is
   delivered twice and no old body is downloaded again.
 - Changing the account's `user` or `host`, or between POP3 and IMAP, starts with empty state (everything
-  there is new). Renaming a user moves her state file and her aliases.
+  there is new). Renaming a user moves the user's state file and aliases.
 - A message counts as taken only once it is stored; then the state is saved, then the server is
   told (seen/delete). A crash between storing and saving can deliver one message twice, never
   lose one.
@@ -460,9 +461,9 @@ mail programs do not read its mailboxes. On the internet side it is a mail clien
 `fetch` and `smtp`), or it sits behind a real mail server (the `gateway`). Only the parts of
 `po.json` that matter are shown; any key not shown keeps its default.
 
-**1. Each user brings her own mailbox (no domain of your own).** This needs no `gateway`
-section. Every user fetches her provider's mailbox and sends through its server, under her own
-address:
+**1. Each user brings their own mailbox (no domain of your own).** This needs no `gateway`
+section. Every user fetches mail from the user's provider and sends through its server, under
+the user's own address:
 
     "users": {
       "Smith, Ann": {"password": "pw", "email": "ann.smith@gmail.com",
@@ -503,7 +504,7 @@ address:
   address, so keep `email` equal to the login address. Carol's smtp `user` is not an address,
   so her `email` is required: without it her internet mail is refused with a report.
 - **No `gateway` section** here, so only users with their own `smtp` can send to the internet; a
-  user with only `fetch` receives but her outgoing internet mail is refused at upload.
+  user with only `fetch` receives, but that user's outgoing internet mail is refused at upload.
 - **A server of your own with a self-signed certificate** (Dovecot, Postfix on the LAN):
   `"protocol": "imap", "security": "starttls", "verify_tls": false` (and `"verify_tls": false` in
   `smtp`). Only do this on a network you trust.
@@ -579,8 +580,8 @@ bounces it.
   but people rarely type it, so give him an `email` such as `bob@example.org` (the alias already
   delivers it).
 - **Outbound route:** mail of users without their own `smtp` goes to the `smarthost`, with
-  whatever From applies (her `email` may be on another domain; the relay may refuse that). Without
-  a `smarthost` that mail is accepted and waits in `outbound/` until one is set.
+  whatever From applies (a user's `email` may be on another domain; the relay may refuse that).
+  Without a `smarthost` that mail is accepted and waits in `outbound/` until one is set.
 - **The smarthost on localhost** is plain SMTP (`security` `none`, the default). Postfix relays
   for it without AUTH because 127.0.0.1 is in its `mynetworks` (the default since Postfix 3.0,
   `mynetworks_style = host`). If you set `"security": "starttls"` towards a local MTA whose
@@ -628,13 +629,13 @@ bounces it.
   for the smarthost (`"smarthost": "127.0.0.1:2526"`) and stores each message as an `.eml` file.
 
 **3. Both at once.** Most users go through the domain (example 2); a user's own settings take
-precedence where she has them:
+precedence where the user has them:
 
-- with her own `smtp`: her mail goes only through that server, never the smarthost;
-- with her own `email` (and any domain): it is her From, and mail to it reaches her through the
-  listener when the MTA hands it over (and by her `fetch`, if she has one);
-- with only `fetch`: she receives her private mailbox, and sends through the smarthost from her
-  generated domain address (or her `email`, if set).
+- with their own `smtp`: the user's mail goes only through that server, never the smarthost;
+- with their own `email` (and any domain): it is the user's From, and mail to it reaches the user
+  through the listener when the MTA hands it over (and by the user's `fetch`, if there is one);
+- with only `fetch`: the user receives mail from the private mailbox, and sends through the
+  smarthost from the generated domain address (or the `email`, if set).
 
 ## Specifications
 

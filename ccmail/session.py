@@ -95,7 +95,7 @@ class Call:
         log.info("%s: done, %d received, %d sent", self.name, self.received, self.sent)
 
     def start_fetch(self):
-        """A user with her own "fetch" account (fetch.py): fetch it now, in a thread, while the
+        """A user with their own "fetch" account (fetch.py): fetch it now, in a thread, while the
         caller uploads; (thread, deadline) or None."""
         fetcher = getattr(self.po, "fetcher", None)
         if not fetcher or not self.user or self.caller_po or self.readonly or not fetcher.has(self.user):
