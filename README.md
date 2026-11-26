@@ -27,7 +27,9 @@ It does not include, and does not need, any Lotus or HP software.
   per-message limits, send order (directory updates, urgent, normal, low), non-delivery reports.
 - **Users and passwords**: password change from the client, lockout after repeated failures,
   read-only access for unknown callers (configurable).
-- **Code pages**: per-user DOS code pages; messages are converted for each receiver.
+- **Code pages**: per-user DOS code pages; messages are tagged on upload and converted for each
+  receiver, and the gateway converts to and from internet character sets. Besides the usual DOS
+  and Windows pages, 1125 (`866u`, RUSCII, Ukrainian DOS) is built in.
 - **Directory**: address book commands; directory update messages for clients; directory exchange
   with peer post offices, so all post offices share one address book.
 - **Post office to post office**: mail routing to and from peer post offices, calling them and
@@ -45,8 +47,10 @@ It does not include, and does not need, any Lotus or HP software.
 
 ## Requirements
 
-Python 3 (developed and tested on 3.13), standard library only. `pyserial` (3.x) is needed for
-serial ports (`serve --serial`, `call` with `"dial"`); TCP and Telnet work without it.
+Python 3 (developed and tested on 3.13), standard library only, on a POSIX system such as Linux
+(file locking uses `fcntl`). `pyserial` (3.x) is needed for serial ports (`serve --serial`,
+`call` with `"dial"`); TCP and Telnet work without it. The TLS tests also use `openssl` (see
+[Tests](#tests)).
 
 ## Running
 
@@ -54,10 +58,16 @@ serial ports (`serve --serial`, `call` with `"dial"`); TCP and Telnet work witho
     python3 -m ccmail.server serve --data data-test --telnet-port 2323
     python3 -m ccmail.server serve --data data-test --serial /dev/ttyUSB0 --baud 2400 --serial-only
 
-`--data` is the post office directory: `po.json` (configuration) plus folders created at run time
-(`mail/<user>/` waiting mail, `received/`, `delivered/<user>/`, `route/<post office>/`,
-`outbound/`, `inbound/`, `fetch/<user>.json`, ...). Each message is stored in its wire form
-(`.msg`) and as readable text (`.txt`).
+`--data` is the post office directory: `po.json` (configuration) plus what is created at run
+time: `mail/<user>/` waiting mail, `received/` uploads, `delivered/<user>/`, `route/<post office>/`
+mail for peer post offices, `outbound/` internet mail waiting to go out, then `sent/` or `failed/`,
+`inbound/` the original internet mail, `fetch/<user>.json` fetch state, `vim/<user>/` HP 200LX
+interactive-mode folders and drafts, `deleted/` (messages deleted in interactive mode, deleted
+users), `ade.json` the directory learned from peer post offices. Each message is stored in its
+wire form (`.msg`) and as readable text (`.txt`).
+
+`-v` (`--verbose`, before the command: `python3 -m ccmail.server -v serve ...`) logs at debug
+level.
 
 Options of `serve` (`serve --help` lists them with examples; the serial and modem options are
 described under [Connections](#connections)):
@@ -82,6 +92,7 @@ needed. With `--modem` the CONNECT speed is used unless `--line-bps` is given.
 ### Mail and address book
 
     python3 -m ccmail.server send --data DIR --from user1 --to user --subject Hi --text "Hello" [--attach FILE] [--priority 2]
+    python3 -m ccmail.server send --data DIR --from bob --to "user at BRANCH" --to alice --subject Hi --file note.txt
     python3 -m ccmail.server show DIR/received/<id>.msg
 
     python3 -m ccmail.server user list   --data DIR
@@ -93,13 +104,29 @@ needed. With `--modem` the CONNECT speed is used unless `--line-bps` is given.
     python3 -m ccmail.server user del    --data DIR user1 [--yes]           # asks first
     python3 -m ccmail.server unlock      --data DIR user
     python3 -m ccmail.server po list|add|set|del --data DIR BRANCH --password P --call-password C --connect host:port --mode LSEC
-    python3 -m ccmail.server directory   --data DIR --to user
+    python3 -m ccmail.server po del      --data DIR BRANCH [--force]        # --force: even with mail waiting for it
+    python3 -m ccmail.server directory   --data DIR --to user [--to user2] [--delete "Old, Name"]
 
-A running server picks up changes to `po.json`. Every user or post office change queues a
-directory update with that entry for all users (`--no-update` to skip); a new user gets the whole
-directory. Names are unique across users and post offices, at most 126 characters; passwords at
-most 63. `user set --email` checks that the address has the form name@domain and that no other
-user has it; it keeps the user's other settings (`smtp`, `fetch`, ...).
+`send` puts a message into the post office as if a user had written it: `--to` is repeatable and
+takes local users, `name at POSTOFFICE` for a peer post office (one copy per post office) and
+names learned by directory exchange. The text comes from `--text` or `--file` (UTF-8);
+`--attach` is repeatable, `--priority` is 0 (normal), 1 (low) or 2 (urgent), `--folder` names
+the receiver's folder the client files the message in (when it has one of that name).
+
+A running server picks up changes to `po.json`. `user add`, `user rename`, `user del`, `po add`
+and `po del` queue a directory update with that entry for all users, and `user set` does so when
+it sets a comment (`--no-update` to skip); a new user gets the whole directory. The same changes
+also go to the peer post offices that exchange directories with us (`"ade"`). `user passwd`,
+`po set` and `user set` with only `--codepage` or `--email` change `po.json` only. `directory`
+sends the whole directory to the given users, `--delete` also removes an entry from their copy.
+
+Names are unique across users and post offices (and names learned from peers), at most 126
+characters, and may not contain `@` or ` at `; passwords at most 63. `user set --email` checks
+that the address has the form name@domain and that no other user has it; it keeps the user's
+other settings (`smtp`, `fetch`, ...). `po` sets the post office's `password` (what it sends us,
+required for `add`), `call_password` (what we send it), `connect` and `mode` (`LSEC`, `HSEC` or
+`RAW`; `HSEC` when not set); an empty value removes the key. Calling by modem (`"dial"`) is set
+up by editing `po.json` (see [Connections](#connections)).
 
 `user del` first lists what goes: waiting and delivered mail, interactive-mode folders and drafts,
 fetch state, the email address, the fetch and SMTP accounts (host and login, never the password),
@@ -123,9 +150,17 @@ next to `serve`: one fetch per user runs at a time. `serve` itself polls each ac
     python3 -m ccmail.server call --data DIR BRANCH                  # call a peer post office now
     python3 -m ccmail.server call --data DIR BRANCH --capture call.bin   # by modem: record the line
     python3 -m ccmail.server ade sync|request|update|list --data DIR BRANCH
+    python3 -m ccmail.server ade request --data DIR BRANCH --all     # ask for its whole directory
 
 `call` connects to the post office's `"connect"` address over TCP, or, with `"dial"`, through our
 own modem (see [Connections](#connections)). `po list` shows the address or the dial string.
+Mail for a peer waits in `route/<post office>/` until we call it or it calls us.
+
+Directory exchange runs with the peers that have `"ade"` set in `po.json`. Their updates and
+synchs are kept in `ade.json`: learned users can be addressed by name and are in the directory
+our users get. Their synch requests are answered with a synch. The `ade` commands queue a message
+that goes at the next call: `sync` a full synch of our directory, `request` a synch request
+(`--all`: its whole directory), `update` our users as an update; `list` shows what was learned.
 
 ## Connections
 
@@ -156,9 +191,9 @@ settings, SET-CONTROL, the two masks and PURGE-DATA are acknowledged. They are o
 is no port behind the server to change. NOTIFY-MODEMSTATE reports CD, DSR and CTS on;
 flow-control suspend/resume is logged only; there are no line state notifications and no BREAK.
 
-Unless `--serial-only` is given, the raw ports (default 5003 and 3264) always open, in addition to
-any Telnet ports. `--serial-only` opens no TCP port at all and cannot be combined with
-`--telnet-port`.
+Unless `--serial-only` is given, the `--port` ports (default 5003 and 3264) always open, raw or,
+with `--telnet`, as Telnet, in addition to any `--telnet-port` ports. `--serial-only` opens no TCP
+port at all and cannot be combined with `--telnet-port`.
 
 ### Serial ports
 
@@ -227,9 +262,10 @@ With `--modem` the port settings are for the link between the server and the mod
   Each command waits 3 s for OK. A failed round escapes (`+++` with guard times), toggles DTR and
   starts again, up to 3 rounds; then the server waits 10 s and tries again. The modem's replies
   are logged.
-- **Answer**: `RING` gets `ATA`. With `--modem-autoanswer N` the init adds `ATS0=N` and the server
-  waits for the modem to answer by itself. `NO CARRIER`, `BUSY`, `ERROR` or `NO ANSWER` end the
-  attempt; the server re-initialises the modem and waits again.
+- **Answer**: `RING` gets `ATA`, and CONNECT must follow within 60 s. With
+  `--modem-autoanswer N` (1-255 rings) the init adds `ATS0=N` and the server waits for the modem
+  to answer by itself. `NO CARRIER`, `BUSY`, `ERROR`, `NO ANSWER` or `NO DIALTONE` (or their
+  numeric codes) end the attempt; the server re-initialises the modem and waits again.
 - **CONNECT speed** (the call's line speed):
   - A bare `CONNECT` means 300 bps; `CONNECT 14400/ARQ` means 14400.
   - A `CARRIER 9600` line before CONNECT, from modems set to report it, is the line speed and
@@ -243,8 +279,9 @@ With `--modem` the port settings are for the link between the server and the mod
     (a device, rfc2217://);
   - on `NO CARRIER` at the end of the received data followed by 0.5 s of quiet. A message that
     contains the text does not end the call, and the modem's line is not passed to the session.
-- **Hang-up**: DTR goes low for 1 s (with &D2 the modem hangs up), then `ATH0`; without an OK,
-  `+++` with guard times and `ATH0` again. Then the modem is re-initialised for the next RING.
+- **Hang-up**: 1 s after the session ends (the modem's buffers drain), DTR goes low for 1 s
+  (with &D2 the modem hangs up), then `ATH0`; without an OK, `+++` with guard times and `ATH0`
+  again. Then the modem is re-initialised for the next RING.
 - **Errors**: an error during a call is logged and the modem re-initialised. A port that is gone
   (device unplugged, network connection lost) ends the serial service; there is no reconnect.
 
@@ -255,7 +292,7 @@ With `--modem` the port settings are for the link between the server and the mod
                  "dial": "ATDT5551234",                  # instead of "connect"
                  "modem": "/dev/ttyS0",                  # or "rfc2217://ts:7002"
                  "baud": 38400, "framing": "8N1", "flow": "rtscts",            # optional
-                 "modem_init": "ATZ;AT E0 V1 Q0 &C1 &D2 S0=0"}}               # optional
+                 "modem_init": "ATZ;AT E0 V1 Q0 &C1 &D2 S0=0"}}               # optional; or a list
 
     python3 -m ccmail.server call --data D BRANCH [--capture call.bin]
 
@@ -263,7 +300,8 @@ The init, CONNECT parsing and hang-up are the same as when answering. Then the u
 peer post office (`spec/router-to-router.md` 7.2) runs over the line, with the CONNECT speed as
 its line speed.
 
-If the call fails (`BUSY`, `NO CARRIER`, `NO ANSWER`, or no CONNECT within 90 s), the command says
+If the call fails (`BUSY`, `NO CARRIER`, `NO ANSWER`, `NO DIALTONE`, `ERROR`, or no CONNECT
+within 90 s), the command says
 why and exits with status 1. The port settings are checked with the same rules as `--serial`.
 
 The `call` command needs the modem port to itself, so stop a `serve --modem` on the same port
@@ -304,21 +342,24 @@ There is no call scheduler yet.
 
 | key | meaning |
 |---|---|
-| `lock_after` | lock a mailbox after N wrong passwords (0 = never); `unlock` clears it |
-| `allow_readonly` | unknown callers get a read-only connection (they may send, not receive) |
-| `max_msgs`, `msg_size_kb` | messages accepted per call and largest message size (0 = no limit) |
-| `codepage`, user `codepage` | the DOS code page of the post office and of each user's PC |
-| `ccintl` | path of a `CCINTL.TB` code page table file, if you have one (otherwise Python's codecs are used) |
+| `users` | `"name": "password"`, or `"name": {"password": ..., ...}` with the optional keys below |
+| `lock_after` | lock a mailbox after N wrong passwords (default 0 = never); `unlock` clears it. The counts are kept in `failed_attempts` |
+| `allow_readonly` | unknown callers get a read-only connection (they may send, not receive); default true, false refuses them |
+| `max_msgs`, `msg_size_kb` | messages accepted per call and largest message size in units of 1000 bytes (default 0 = no limit) |
+| `codepage`, user `codepage` | the DOS code page of the post office (default 437) and of each user's PC (default the post office's); a number, or a name such as `866u` (= 1125) |
+| `ccintl` | path of a `CCINTL.TB` code page table file, if you have one; one in the data directory is used without this key (otherwise Python's codecs are used) |
 | `admin` | the mailbox that receives mail addressed to "Administrator" (default `admin`) |
 | `ndr_cc_admin` | copy non-delivery reports to the administrator |
 | post office `ade` | exchange directory updates with this peer (`true`, or `{"prop": "0x53"}`) |
+| post office `password`, `call_password` | what it sends us when it calls, what we send when we call it |
 | post office `connect` | `host:port` to call it at over TCP |
+| post office `mode` | packet mode when we call it: `LSEC`, `HSEC` (default) or `RAW` |
 | post office `dial`, `modem` | call it through our own modem instead: the dial command (`ATDT...`) and the modem's device or `rfc2217://` URL; optional `baud`, `framing`, `flow`, `modem_init` (see [Connections](#connections)) |
-| `gateway` | the internet gateway: its post office name in the directory, the mail `domain` of local users, inbound SMTP `listen` address, outbound `smarthost` (with `starttls`, `username`, `password`), retries |
+| `gateway` | the internet gateway: its `post_office` name in the directory (default `INTERNET`), the mail `domain` of local users (default `localhost`), inbound SMTP `listen` address (none = no listener), outbound `smarthost` (with `starttls`, `username`, `password`), retries every `retry_seconds` (default 3600), `retry_times` (default 72) |
 | gateway `aliases` | inbound address -> user: a local part (for the gateway `domain` only) or a full address (any domain); case does not matter |
 | user `email` | the user's own internet address: From and envelope sender of the mail she writes, and inbound mail to it (any domain) reaches her |
 | user `smtp` | her own outgoing server: `host`, `port` (default 587, 465 for `ssl`), `security` `starttls` (default) \| `ssl` \| `none`, `user`, `password`, `verify_tls` (default true) |
-| user `fetch` | her own mailbox to fetch: `protocol` `pop3` \| `pop3s` \| `imap` \| `imaps`, `host`, `port` (default 110/995, 143/993), `security` (default `ssl` for pop3s/imaps, else `starttls`), `user`, `password`, `folder` (IMAP, default INBOX), `interval` seconds (default 300), `after` `keep` (default) \| `seen` \| `delete`, `verify_tls` (default true) |
+| user `fetch` | her own mailbox to fetch: `protocol` `pop3` \| `pop3s` \| `imap` \| `imaps`, `host`, `port` (default 110/995, 143/993, by `security`), `security` `ssl` \| `starttls` \| `none` (default `ssl` for pop3s/imaps, else `starttls`), `user`, `password`, `folder` (IMAP, default INBOX), `interval` seconds (default 300, at least 10), `after` `keep` (default) \| `seen` \| `delete`, `verify_tls` (default true) |
 
 `data-test/` and `data-r2r/` are example post offices.
 
@@ -334,7 +375,9 @@ user has one, it takes precedence over the shared gateway settings:
 
 - **Inbound matching**, in this order: gateway `aliases` (full address, then the local part when
   the domain is ours), a user's own `email`, then the generated-name rules of the gateway
-  (`spec/smtp-link.md` §3.3). Inbound To/Cc addresses that are local users (also by alias or own
+  (`spec/smtp-link.md` §3.3: the exact name, `_` or `.` for a space, `Name_at_POSTOFFICE`;
+  `postmaster`, `root` and `administrator` reach the `admin` mailbox). Inbound To/Cc addresses
+  that are local users (also by alias or own
   address) are not repeated as internet recipients.
 - **From address**: her `email`; without it, the smtp `user` if that is an address; otherwise the
   generated `Name@domain`. A user with `smtp` but no usable address has her internet mail refused
