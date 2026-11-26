@@ -374,9 +374,12 @@ Every per-user setting is optional; a user without them is handled exactly as be
 user has one, it takes precedence over the shared gateway settings:
 
 - **Inbound matching**, in this order: gateway `aliases` (full address, then the local part when
-  the domain is ours), a user's own `email`, then the generated-name rules of the gateway
-  (`spec/smtp-link.md` §3.3: the exact name, `_` or `.` for a space, `Name_at_POSTOFFICE`;
-  `postmaster`, `root` and `administrator` reach the `admin` mailbox). Inbound To/Cc addresses
+  the domain is ours), a user's own `email` (or, without one, her smtp `user` when that is an
+  address), then the generated-name rules of the gateway (`spec/smtp-link.md` §3.3: the exact
+  name, `_` or `.` for a space, `First_Last` also for `Last, First`, `Name_at_POSTOFFICE` with
+  our own post office's name; `postmaster`, `root` and `administrator` reach the `admin`
+  mailbox; case does not matter). Users of peer post offices are not reached this way: their
+  `Name_at_BRANCH` addresses are refused. Inbound To/Cc addresses
   that are local users (also by alias or own
   address) are not repeated as internet recipients.
 - **From address**: her `email`; without it, the smtp `user` if that is an address; otherwise the
@@ -424,6 +427,146 @@ stored message (a `.lock` file next to it allows one fetch per user at a time, a
 - A message counts as taken only once it is stored; then the state is saved, then the server is
   told (seen/delete). A crash between storing and saving can deliver one message twice, never
   lose one.
+
+### Examples: connecting to today's mail
+
+ccmulator stays the post office for the cc:Mail side. It is not an IMAP or POP3 server, so desktop
+mail programs do not read its mailboxes. On the internet side it is a mail client (per-user
+`fetch` and `smtp`), or it sits behind a real mail server (the `gateway`). Only the parts of
+`po.json` that matter are shown; any key not shown keeps its default.
+
+**1. Each user brings her own mailbox (no domain of your own).** This needs no `gateway`
+section. Every user fetches her provider's mailbox and sends through its server, under her own
+address:
+
+    "users": {
+      "Smith, Ann": {"password": "pw", "email": "ann.smith@gmail.com",
+        "fetch": {"protocol": "imaps", "host": "imap.gmail.com",
+                  "user": "ann.smith@gmail.com", "password": "app password", "after": "keep"},
+        "smtp":  {"host": "smtp.gmail.com", "port": 587, "security": "starttls",
+                  "user": "ann.smith@gmail.com", "password": "app password"}},
+      "Jones, Bob": {"password": "pw", "email": "bob@fastmail.example",
+        "fetch": {"protocol": "imaps", "host": "imap.fastmail.example", "folder": "INBOX",
+                  "user": "bob@fastmail.example", "password": "app password", "interval": 600},
+        "smtp":  {"host": "smtp.fastmail.example", "port": 465, "security": "ssl",
+                  "user": "bob@fastmail.example", "password": "app password"}},
+      "Doe, Carol": {"password": "pw", "email": "carol@isp.example",
+        "fetch": {"protocol": "pop3s", "host": "pop.isp.example",
+                  "user": "carol", "password": "...", "after": "delete"},
+        "smtp":  {"host": "mail.isp.example", "user": "carol", "password": "..."}}
+    }
+
+- **Passwords:** ccmulator logs in with a password (IMAP/POP3 LOGIN, SMTP AUTH). Providers that
+  use two-step sign-in want an *app password* made for this purpose, and some accounts allow only
+  token (OAuth2) sign-in, which ccmulator does not do. For such an account, have the provider
+  forward the mail to a mailbox ccmulator can fetch, or to your own domain (example 2).
+- **The first fetch takes everything there:** every message in the IMAP `folder` (INBOX unless
+  set) or the POP3 mailbox is new to ccmulator and goes to the user's cc:Mail mailbox, however
+  old. For a mailbox with years of mail, point `folder` at an IMAP folder made for this (filled
+  by a server-side filter rule, say), or start from an emptied mailbox.
+- **Fetch modes:** `"after": "keep"` (the default) leaves the mail on the server untouched: IMAP
+  folders are opened read-only, so the messages also stay unread in the provider's web mail;
+  ccmulator remembers what it took. `"seen"` marks them read (IMAP only; for POP3 it is the
+  same as `keep`). `"delete"` removes them once stored; that suits a POP3 mailbox that should
+  not fill up.
+- **Ports and security:** `pop3s` and `imaps` use implicit TLS on 995 and 993; `pop3` and
+  `imap` default to STARTTLS on 110 and 143 and refuse to log in when the server does not offer
+  it (`"security": "none"` allows clear text). `interval` is in seconds (default 300, at least 10);
+  `serve` also fetches when the user calls in.
+- **Sending:** without `port`, `smtp` uses 587 with `starttls`, or 465 when `"security": "ssl"`
+  (implicit TLS, as Bob has). Many providers rewrite or refuse a From that is not the account's
+  address, so keep `email` equal to the login address. Carol's smtp `user` is not an address,
+  so her `email` is required: without it her internet mail is refused with a report.
+- **No `gateway` section** here, so only users with their own `smtp` can send to the internet; a
+  user with only `fetch` receives but her outgoing internet mail is refused at upload.
+- **A server of your own with a self-signed certificate** (Dovecot, Postfix on the LAN):
+  `"protocol": "imap", "security": "starttls", "verify_tls": false` (and `"verify_tls": false` in
+  `smtp`). Only do this on a network you trust.
+- **Check an account without waiting for a call:**
+  `python3 -m ccmail.server fetch --data DIR "Smith, Ann"` (without a name: every user with
+  `fetch`). It prints how many messages it took and their senders and subjects, or the error, and
+  exits with status 1 if an account failed. The messages wait in `DIR/mail/<user>/` as `.msg`
+  with a readable `.txt` copy next to each; `python3 -m ccmail.server show "DIR/mail/Smith,
+  Ann/<id>.msg"` prints one.
+
+**A shared mailbox for one user.** `fetch` delivers everything in the account to that user,
+whatever the To header says, so a mailbox such as `info@company.example` can be read by one
+cc:Mail user. A user has one `fetch` account; for a second mailbox, add a cc:Mail user for it:
+
+    "Info Desk": {"password": "pw", "email": "info@company.example",
+      "fetch": {"protocol": "pop3s", "host": "pop.company.example",
+                "user": "info@company.example", "password": "...", "after": "delete"},
+      "smtp":  {"host": "smtp.company.example",
+                "user": "info@company.example", "password": "..."}}
+
+**2. Your own domain, with a mail server in front.** The gateway's SMTP listener has no TLS and
+no authentication, so keep it on localhost and let a real MTA (Postfix, Exim) face the internet:
+the MX record, spam filtering, TLS. The MTA hands the domain's mail to ccmulator and relays what
+ccmulator sends out:
+
+    "users": {
+      "Smith, Ann": {"password": "pw", "email": "ann.smith@example.org"},
+      "Jones, Bob": {"password": "pw"}
+    },
+    "gateway": {
+      "domain": "example.org",
+      "listen": "127.0.0.1:2525",
+      "smarthost": "127.0.0.1:25",
+      "aliases": {"sales": "Smith, Ann", "bob": "Jones, Bob", "info@company.example": "Smith, Ann"}
+    }
+
+Postfix on the same machine, `main.cf`:
+
+    relay_domains = example.org
+    transport_maps = hash:/etc/postfix/transport
+
+and `/etc/postfix/transport` (run `postmap /etc/postfix/transport` after editing):
+
+    example.org    smtp:[127.0.0.1]:2525
+
+- **Addresses that arrive without an alias:** the name rules accept the name with `_` or `.` for
+  the space, in any case, and a `Last, First` name also as `First_Last`. So
+  `ann.smith@example.org`, `Ann_Smith@example.org` and `bob.jones@example.org` reach Ann and Bob
+  as they are, and a user `Kit Walker` gets `Kit_Walker@example.org` or
+  `kit.walker@example.org`. Aliases are for other names (`sales`, `bob`) and, as full
+  addresses, for other domains the MTA hands over (`info@company.example`). Ann's own `email`
+  reaches her as well. There is no catch-all: an address that matches nothing is refused at RCPT.
+- **Users of peer post offices** cannot be reached through the gateway: an address such as
+  `Kit_Walker_at_BRANCH@example.org` is refused. Only `Name_at_MYPOST` with this post office's
+  own name is understood (it reaches the local user).
+- **From addresses:** Ann sends from her `email`, `ann.smith@example.org`. Bob, who has no
+  `email`, sends from the generated address, which keeps the case, turns spaces into `_` and
+  quotes a name with a comma: `"Jones, Bob" <"Jones,_Bob"@example.org>`. Replies to it reach him,
+  but people rarely type it, so give him an `email` such as `bob@example.org` (the alias already
+  delivers it).
+- **Outbound route:** mail of users without their own `smtp` goes to the `smarthost`, with
+  whatever From applies (her `email` may be on another domain; the relay may refuse that). Without
+  a `smarthost` that mail is accepted and waits in `outbound/` until one is set.
+- **Without a local MTA:** point `smarthost` (`host:port`, the port is required) at your
+  provider's relay on port 587, with `"starttls": true, "username": ..., "password": ...`. The
+  smarthost connection is plain SMTP, upgraded with STARTTLS when `starttls` is set (it fails if
+  the relay does not offer it); it does not do implicit TLS (port 465), and the relay's
+  certificate is not checked. A user's own `smtp` checks it (`verify_tls`), so for a relay across
+  the internet, per-user `smtp` or a local MTA is the safer choice. Without `starttls`, a
+  `username` and `password` go out in clear text.
+- **The listener** speaks plain SMTP without STARTTLS or AUTH and answers 550 at RCPT for an
+  address it does not know. Postfix as above accepts any address of the domain first and then
+  bounces those; check Postfix's own options for rejecting unknown relay recipients up front.
+- **Test the inbound side from the command line:** `swaks --server 127.0.0.1 --port 2525 --to
+  sales@example.org --from you@elsewhere.example --body "hello"`, then look in
+  `DIR/mail/Smith, Ann/` (the `.txt` file, or `python3 -m ccmail.server show` on the `.msg`). The
+  original is kept as `DIR/inbound/<id>.eml`. For the outbound side, `python3 tools/smtpsink.py
+  2526 DIR/sink` stands in for the smarthost (`"smarthost": "127.0.0.1:2526"`) and stores each
+  message as an `.eml` file.
+
+**3. Both at once.** Most users go through the domain (example 2); a user's own settings take
+precedence where she has them:
+
+- with her own `smtp`: her mail goes only through that server, never the smarthost;
+- with her own `email` (and any domain): it is her From, and mail to it reaches her through the
+  listener when the MTA hands it over (and by her `fetch`, if she has one);
+- with only `fetch`: she receives her private mailbox, and sends through the smarthost from her
+  generated domain address (or her `email`, if set).
 
 ## Specifications
 
