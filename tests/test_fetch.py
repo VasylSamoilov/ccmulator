@@ -29,7 +29,7 @@ HAVE_OPENSSL = shutil.which("openssl") is not None
 
 
 def mail(n, sender="Alice <alice@example.com>", to="ann@isp.example", mid=True):
-    h = f"From: {sender}\r\nTo: {to}\r\nSubject: message {n}\r\nDate: Thu, 26 Nov 2026 10:00:{n:02d} +0000\r\n"
+    h = f"From: {sender}\r\nTo: {to}\r\nSubject: message {n}\r\nDate: Thu, 26 Nov 2026 10:{n // 60:02d}:{n % 60:02d} +0000\r\n"
     if mid:
         h += f"Message-ID: <m{n}@example.com>\r\n"
     return (h + f"\r\nbody of message {n}\r\n.line starting with a dot\r\n").encode()
@@ -422,6 +422,54 @@ class POP3Test(FetchBase):
         self.assertEqual(srv.msgs, [])                       # the taken one deleted again
         self.assertEqual(len(self.mailbox()), 2)
 
+    def test_initial_default_takes_newest_100(self):
+        srv = FakePOP3([mail(n) for n in range(1, 151)])
+        fx = self.configure(srv, protocol="pop3", after="delete")
+        taken = fx.fetch_user("Smith, Ann")
+        self.assertEqual([t["subject"] for t in taken], [f"message {n}" for n in range(51, 151)])
+        retr = [c for c in srv.commands if c.upper().startswith("RETR")]
+        self.assertEqual(retr, [f"RETR {n}" for n in range(51, 151)])    # older bodies not read
+        dele = [c for c in srv.commands if c.upper().startswith("DELE")]
+        self.assertEqual(dele, [f"DELE {n}" for n in range(51, 151)])    # older ones untouched
+        self.assertEqual([u for u, _ in srv.msgs], [f"uid-{n}" for n in range(1, 51)])
+        st = self.state()
+        self.assertEqual(sorted(st["skipped"]), sorted(f"uid-{n}" for n in range(1, 51)))
+        self.assertEqual(len(st["uidls"]), 100)
+        # later fetches take only new mail; the older ones stay on the server
+        n = len(srv.commands)
+        self.assertEqual(self.fetcher().fetch_user("Smith, Ann"), [])
+        srv.add(mail(151))
+        self.assertEqual([t["subject"] for t in fx.fetch_user("Smith, Ann")], ["message 151"])
+        self.assertEqual([c for c in srv.commands[n:] if c.upper().startswith(("RETR", "DELE"))],
+                         ["RETR 51", "DELE 51"])
+        self.assertEqual(len(srv.msgs), 50)
+        self.assertEqual(len(self.mailbox()), 101)
+
+    def test_initial_zero_takes_all(self):
+        srv = FakePOP3([mail(n) for n in range(1, 151)])
+        fx = self.configure(srv, protocol="pop3", initial=0)
+        self.assertEqual(len(fx.fetch_user("Smith, Ann")), 150)
+        self.assertNotIn("skipped", self.state())
+
+    def test_initial_larger_than_mailbox(self):
+        srv = FakePOP3([mail(n) for n in range(1, 6)])
+        fx = self.configure(srv, protocol="pop3", initial=10)
+        self.assertEqual(len(fx.fetch_user("Smith, Ann")), 5)
+        self.assertNotIn("skipped", self.state())
+
+    def test_initial_again_after_account_change(self):
+        srv = FakePOP3([mail(n) for n in range(1, 6)])
+        fx = self.configure(srv, protocol="pop3", initial=2)
+        self.assertEqual([t["subject"] for t in fx.fetch_user("Smith, Ann")], ["message 4", "message 5"])
+        self.assertEqual(fx.fetch_user("Smith, Ann"), [])
+        srv.add(mail(6))
+        fx = self.configure(srv, protocol="pop3", initial=3, host="localhost")    # another account
+        self.assertEqual([t["subject"] for t in fx.fetch_user("Smith, Ann")],
+                         ["message 4", "message 5", "message 6"])
+        self.assertEqual(self.state()["account"], "pop3://ann@localhost")
+        self.assertEqual(self.state()["skipped"], ["uid-1", "uid-2", "uid-3"])
+        self.assertEqual(fx.fetch_user("Smith, Ann"), [])
+
     @unittest.skipUnless(HAVE_OPENSSL, "needs openssl for a test certificate")
     def test_stls(self):
         ctx = make_cert(self.root)
@@ -515,6 +563,60 @@ class IMAPTest(FetchBase):
         self.assertEqual(fx.fetch_user("Smith, Ann"), [])
         self.assertEqual(len(self.mailbox()), 3)
 
+    def test_initial_default_takes_newest_100(self):
+        srv = FakeIMAP([mail(n) for n in range(1, 151)])
+        fx = self.configure(srv, protocol="imap", after="delete")
+        taken = fx.fetch_user("Smith, Ann")
+        self.assertEqual([t["subject"] for t in taken], [f"message {n}" for n in range(51, 151)])
+        bodies = [c for c in srv.commands if c.upper().startswith("UID FETCH")]
+        self.assertEqual(bodies, [f"UID FETCH {n} (BODY.PEEK[])" for n in range(51, 151)])
+        stores = [c for c in srv.commands if c.upper().startswith("UID STORE")]
+        self.assertEqual(len(stores), 100)
+        self.assertEqual([m["uid"] for m in srv.msgs], list(range(1, 51)))
+        self.assertEqual(srv.flags(), [[]] * 50)             # older ones untouched
+        self.assertEqual(self.state()["folders"]["INBOX"]["last_uid"], 150)
+        n = len(srv.commands)
+        self.assertEqual(self.fetcher().fetch_user("Smith, Ann"), [])
+        srv.add(mail(151))
+        self.assertEqual([t["subject"] for t in fx.fetch_user("Smith, Ann")], ["message 151"])
+        self.assertEqual([c for c in srv.commands[n:] if c.upper().startswith("UID FETCH")],
+                         ["UID FETCH 151 (BODY.PEEK[])"])
+        self.assertEqual(len(srv.msgs), 50)
+        self.assertEqual(len(self.mailbox()), 101)
+
+    def test_initial_zero_takes_all(self):
+        srv = FakeIMAP([mail(n) for n in range(1, 151)])
+        fx = self.configure(srv, protocol="imap", initial=0)
+        self.assertEqual(len(fx.fetch_user("Smith, Ann")), 150)
+        self.assertEqual(srv.flags(), [[]] * 150)            # keep
+
+    def test_initial_larger_than_mailbox(self):
+        srv = FakeIMAP([mail(n) for n in range(1, 6)])
+        fx = self.configure(srv, protocol="imap", initial=10)
+        self.assertEqual(len(fx.fetch_user("Smith, Ann")), 5)
+
+    def test_initial_again_after_account_change(self):
+        srv = FakeIMAP([mail(n) for n in range(1, 6)])
+        fx = self.configure(srv, protocol="imap", initial=2)
+        self.assertEqual([t["subject"] for t in fx.fetch_user("Smith, Ann")], ["message 4", "message 5"])
+        self.assertEqual(self.state()["folders"]["INBOX"]["last_uid"], 5)
+        srv.add(mail(6))
+        fx = self.configure(srv, protocol="imap", initial=3, host="localhost")    # another account
+        self.assertEqual([t["subject"] for t in fx.fetch_user("Smith, Ann")],
+                         ["message 4", "message 5", "message 6"])
+        self.assertEqual(self.state()["account"], "imap://ann@localhost")
+        self.assertEqual(fx.fetch_user("Smith, Ann"), [])
+
+    def test_initial_skipped_not_taken_after_uidvalidity_change(self):
+        srv = FakeIMAP([mail(n) for n in range(1, 6)])
+        fx = self.configure(srv, protocol="imap", initial=2)
+        fx.fetch_user("Smith, Ann")
+        srv.renumber(100, uidvalidity=8)
+        srv.add(mail(6))
+        self.assertEqual([t["subject"] for t in fx.fetch_user("Smith, Ann")], ["message 6"])
+        self.assertEqual(self.state()["folders"]["INBOX"]["last_uid"], 105)
+        self.assertEqual(len(self.mailbox()), 3)
+
     def test_uid_after_literal(self):
         srv = FakeIMAP([mail(1), mail(2)], uid_last=True)
         fx = self.configure(srv, protocol="imap")
@@ -564,6 +666,9 @@ class ConfigTest(unittest.TestCase):
         c = F.fetch_config({"protocol": "imaps", "host": "h", "user": "u"}, "x")
         self.assertEqual((c["security"], c["port"], c["folder"], c["interval"], c["after"], c["verify_tls"]),
                          ("ssl", 993, "INBOX", 300, "keep", True))
+        self.assertEqual(c["initial"], 100)
+        self.assertEqual(F.fetch_config({"protocol": "pop3", "host": "h", "user": "u", "initial": 0},
+                                        "x")["initial"], 0)
         c = F.fetch_config({"protocol": "pop3", "host": "h", "user": "u"}, "x")
         self.assertEqual((c["security"], c["port"]), ("starttls", 110))
         self.assertEqual(F.fetch_config({"protocol": "pop3s", "host": "h", "user": "u"}, "x")["port"], 995)
@@ -571,7 +676,9 @@ class ConfigTest(unittest.TestCase):
                                         "x")["port"], 143)
         for bad in ({"protocol": "nntp", "host": "h", "user": "u"}, {"protocol": "pop3", "user": "u"},
                     {"protocol": "pop3", "host": "h", "user": "u", "after": "move"},
-                    {"protocol": "pop3", "host": "h", "user": "u", "security": "tls"}):
+                    {"protocol": "pop3", "host": "h", "user": "u", "security": "tls"},
+                    {"protocol": "pop3", "host": "h", "user": "u", "initial": -1},
+                    {"protocol": "pop3", "host": "h", "user": "u", "initial": "many"}):
             with self.assertRaises(ConfigError):
                 F.fetch_config(bad, "x")
 

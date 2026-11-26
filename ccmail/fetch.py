@@ -12,6 +12,7 @@ po.json, in a user's entry (users can be "name": "password" or "name": {"passwor
               "folder": "INBOX",                             # IMAP only
               "interval": 300,                               # seconds between polls
               "after": "keep" | "seen" | "delete",           # what to do on the server once stored
+              "initial": 100,                                # first sync: newest N only, 0 = all
               "verify_tls": true}
 
 Each message is converted like inbound SMTP mail (Gateway.deliver_inbound: the user's code page,
@@ -30,7 +31,12 @@ State, <data>/fetch/<user>.json, written atomically after every stored message:
   UIDVALIDITY changes, only the headers of the folder are fetched and a message is taken only if
   its key is not remembered, so nothing is delivered twice and no old body is downloaded again.
   A new UID whose key is already remembered is not delivered either (same Message-ID twice).
-- Another account (user or host changed) starts with empty state: everything there is new.
+- Another account (user, host or protocol changed) starts with empty state.
+- First sync (no state for the account, or for an IMAP folder; also an IMAP resync after a
+  UIDVALIDITY change): only the newest "initial" messages (default 100, 0 = all) are taken,
+  newest by server order (IMAP: UID order in the folder; POP3: message number order). The older
+  ones are recorded as known (IMAP: last_uid; POP3: their UIDLs in "skipped") and never taken
+  later, and they are left untouched on the server whatever "after" says.
 Order per message: store, save state, then flag/delete on the server. A crash between storing and
 saving can deliver one message twice; a message is never marked taken before it is stored.
 """
@@ -58,6 +64,7 @@ SECURITY = ("ssl", "starttls", "none")
 AFTER = ("keep", "seen", "delete")
 PORTS = {("pop3", True): 995, ("pop3", False): 110, ("imap", True): 993, ("imap", False): 143}
 KEYS_MAX = 20000
+INITIAL = 100           # default "initial": messages the first sync takes (the newest)
 CALL_WAIT = 10          # seconds a call waits for its fetch before mail is sent to the caller
 POLL_TIMEOUT = 60       # socket timeout of the background poll
 
@@ -86,12 +93,15 @@ def fetch_config(cfg, user) -> dict:
     try:
         port = int(cfg.get("port") or PORTS[(kind, sec == "ssl")])
         interval = max(10, int(cfg.get("interval", 300)))
+        initial = int(cfg.get("initial", INITIAL))
     except (TypeError, ValueError):
-        raise ConfigError(f'user {user}: fetch "port" and "interval" must be numbers') from None
+        raise ConfigError(f'user {user}: fetch "port", "interval" and "initial" must be numbers') from None
+    if initial < 0:
+        raise ConfigError(f'user {user}: fetch "initial" must be 0 (all) or more')
     return {"kind": kind, "host": cfg["host"], "security": sec, "port": port,
             "user": cfg["user"], "password": cfg.get("password", ""),
             "folder": cfg.get("folder") or "INBOX", "interval": interval,
-            "after": after, "verify_tls": bool(cfg.get("verify_tls", True))}
+            "after": after, "initial": initial, "verify_tls": bool(cfg.get("verify_tls", True))}
 
 
 def message_key(raw: bytes) -> str:
@@ -278,10 +288,23 @@ class Fetcher:
                 n, uid = ln.decode("latin-1").split(None, 1)
                 listing[uid.strip()] = int(n)
             # complete listing: forget UIDLs that are gone from the server
+            first = "uidls" not in state
             known = set(state.get("uidls", [])) & set(listing)
+            skipped = set(state.get("skipped", [])) & set(listing)
+            order = sorted(listing.items(), key=lambda x: x[1])
+            if first and cfg["initial"] and len(order) > cfg["initial"]:
+                skipped = {uid for uid, _ in order[:-cfg["initial"]]}
+                log.info("fetch %s: first sync takes the newest %d of %d messages, leaves %d older",
+                         user, cfg["initial"], len(order), len(skipped))
             state["uidls"] = sorted(known)
+            if skipped:
+                state["skipped"] = sorted(skipped)
+            else:
+                state.pop("skipped", None)
             self.save_state(user, state)
-            for uid, n in sorted(listing.items(), key=lambda x: x[1]):
+            for uid, n in order:
+                if uid in skipped:          # older than the first sync took: never taken, untouched
+                    continue
                 if uid in known:
                     if cfg["after"] == "delete":
                         conn.dele(n)
@@ -362,7 +385,7 @@ class Fetcher:
                 fst = old
                 last = fst["last_uid"]
                 todo = [u for u in self._search(conn, "UID", f"{last + 1}:*") if u > last]  # n:* gives the last
-                skip = []
+                done = []
             else:
                 # first sync, or UIDVALIDITY changed: compare headers with the remembered keys
                 keys = old.get("keys", []) if old else []
@@ -371,13 +394,21 @@ class Fetcher:
                              user, folder, old.get("uidvalidity"), uv)
                 fst = folders[folder] = {"uidvalidity": uv, "last_uid": 0, "keys": keys}
                 todo = self._search(conn, "ALL")
+                older = []
+                if cfg["initial"] and len(todo) > cfg["initial"]:
+                    # only the newest by UID; the older ones are passed by last_uid, never touched
+                    older, todo = todo[:-cfg["initial"]], todo[-cfg["initial"]:]
+                    log.info("fetch %s: first sync of %s takes the newest %d of %d messages, leaves %d "
+                             "older", user, folder, len(todo), len(older) + len(todo), len(older))
                 known = set(keys)
-                headers = self._fetch(conn, "1:*", "BODY.PEEK[HEADER]") if known and todo else {}
+                span = f"{todo[0]}:*" if older else "1:*"
+                headers = self._fetch(conn, span, "BODY.PEEK[HEADER]") if known and todo else {}
                 skip = [u for u in todo if u in headers and message_key(headers[u]) in known]
                 todo = [u for u in todo if u not in skip]
                 # last_uid may pass known messages only up to the first one still to take
-                if skip:
-                    fst["last_uid"] = max(skip) if not todo else max(0, min(max(skip), todo[0] - 1))
+                done = older + skip
+                if done:
+                    fst["last_uid"] = max(done) if not todo else max(0, min(max(done), todo[0] - 1))
                 self.save_state(user, state)
             deleted = False
             for uid in todo:
@@ -402,8 +433,8 @@ class Fetcher:
                 elif cfg["after"] == "delete":
                     conn.uid("STORE", str(uid), "+FLAGS.SILENT", r"(\Deleted)")
                     deleted = True
-            if skip and fst["last_uid"] < max(skip):
-                fst["last_uid"] = max(skip)             # everything up to there is taken now
+            if done and fst["last_uid"] < max(done):
+                fst["last_uid"] = max(done)             # everything up to there is taken now
                 self.save_state(user, state)
             if deleted:
                 conn.expunge()

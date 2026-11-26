@@ -366,7 +366,7 @@ There is no call scheduler yet.
 | gateway `aliases` | inbound address -> user: a local part (for the gateway `domain` only) or a full address (any domain); case does not matter |
 | user `email` | the user's own internet address: From and envelope sender of the mail the user writes, and inbound mail to it (any domain) reaches the user |
 | user `smtp` | the user's own outgoing server: `host`, `port` (default 587, 465 for `ssl`), `security` `starttls` (default) \| `ssl` \| `none`, `user`, `password`, `verify_tls` (default true) |
-| user `fetch` | the user's own mailbox to fetch: `protocol` `pop3` \| `pop3s` \| `imap` \| `imaps`, `host`, `port` (default 110/995, 143/993, by `security`), `security` `ssl` \| `starttls` \| `none` (default `ssl` for pop3s/imaps, else `starttls`), `user`, `password`, `folder` (IMAP, default INBOX), `interval` seconds (default 300, at least 10), `after` `keep` (default) \| `seen` \| `delete`, `verify_tls` (default true) |
+| user `fetch` | the user's own mailbox to fetch: `protocol` `pop3` \| `pop3s` \| `imap` \| `imaps`, `host`, `port` (default 110/995, 143/993, by `security`), `security` `ssl` \| `starttls` \| `none` (default `ssl` for pop3s/imaps, else `starttls`), `user`, `password`, `folder` (IMAP, default INBOX), `interval` seconds (default 300, at least 10), `after` `keep` (default) \| `seen` \| `delete`, `initial` (default 100: the first fetch takes only the newest 100 messages and leaves the older ones untouched; `0` = all), `verify_tls` (default true) |
 
 `data-test/` and `data-r2r/` are example post offices.
 
@@ -441,15 +441,20 @@ Fetch state, one file per user in `<data>/fetch/<user>.json`, written atomically
 stored message (a `.lock` file next to it allows one fetch per user at a time, also between
 `serve` and the `fetch` command):
 
-- POP3: the UIDLs taken; UIDLs no longer on the server are dropped after each complete listing. A
-  server without UIDL is refused. With `delete`, a taken message still on the server is deleted
-  again.
+- POP3: the UIDLs taken, and the UIDLs the first sync left (`skipped`); UIDLs no longer on the
+  server are dropped after each complete listing. A server without UIDL is refused. With
+  `delete`, a taken message still on the server is deleted again.
 - IMAP: per folder the UIDVALIDITY, the last UID taken and the keys of the taken messages
   (Message-ID, or a hash of Date/From/To/Subject; the last 20000). When UIDVALIDITY changes, only
   the headers are fetched and a message is taken only if its key is unknown, so nothing is
   delivered twice and no old body is downloaded again.
-- Changing the account's `user` or `host`, or between POP3 and IMAP, starts with empty state (everything
-  there is new). Renaming a user moves the user's state file and aliases.
+- First sync: with no state yet (a new account or IMAP folder, and after a UIDVALIDITY change)
+  only the newest `initial` messages are taken (default 100, `0` = all), newest by server order:
+  UID order in the IMAP folder, message number order on POP3. The older ones are recorded as
+  known (IMAP: the last UID passes them; POP3: their UIDLs), are never taken later and are left
+  untouched on the server, whatever `after` says. Later fetches take every new message.
+- Changing the account's `user` or `host`, or between POP3 and IMAP, starts with empty state, so
+  the first-sync rule applies again. Renaming a user moves the user's state file and aliases.
 - A message counts as taken only once it is stored; then the state is saved, then the server is
   told (seen/delete). A crash between storing and saving can deliver one message twice, never
   lose one.
@@ -486,10 +491,11 @@ the user's own address:
   use two-step sign-in want an *app password* made for this purpose, and some accounts allow only
   token (OAuth2) sign-in, which ccmulator does not do. For such an account, have the provider
   forward the mail to a mailbox ccmulator can fetch, or to your own domain (example 2).
-- **The first fetch takes everything there:** every message in the IMAP `folder` (INBOX unless
-  set) or the POP3 mailbox is new to ccmulator and goes to the user's cc:Mail mailbox, however
-  old. For a mailbox with years of mail, point `folder` at an IMAP folder made for this (filled
-  by a server-side filter rule, say), or start from an emptied mailbox.
+- **The first fetch takes the newest 100:** of the messages already in the IMAP `folder` (INBOX
+  unless set) or the POP3 mailbox, only the newest 100 go to the user's cc:Mail mailbox; the
+  older ones are remembered as seen and stay on the server as they are, even with `"after":
+  "delete"`. Set `"initial"` to another number, or to `0` to take everything there however old.
+  Everything that arrives after the first fetch is taken.
 - **Fetch modes:** `"after": "keep"` (the default) leaves the mail on the server untouched: IMAP
   folders are opened read-only, so the messages also stay unread in the provider's web mail;
   ccmulator remembers what it took. `"seen"` marks them read (IMAP only; for POP3 it is the
