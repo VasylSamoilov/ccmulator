@@ -9,8 +9,10 @@
     python3 -m ccmail.server po add|set|del|list --data DIR [NAME] [...]
     python3 -m ccmail.server fetch --data DIR [USER]              fetch internet mail accounts now
 
-TCP is what the DOSBox-X modem (and later a modem bridge) delivers after CONNECT; the
-connection carries the raw serial bytes.
+Connections (README.md, Connections): TCP ports carry raw session bytes (an emulator's modem,
+newer clients on 3264) or Telnet (--telnet-port, ccmail/telnet.py); --serial DEV|URL is a serial
+port (ccmail/serialport.py) with a client that expects a modem (ccmail/modem.py) or, with
+--modem, our own modem (ccmail/hayes.py), which `call` also uses for po.json "dial" entries.
 """
 import argparse
 import logging
@@ -45,7 +47,13 @@ def handle(conn, addr, po, n, line_bps=None):
 
 def serve(args):
     from .fetch import Fetcher
+    err = check_serve_options(args)
+    if err:
+        sys.exit(err)
     po = PostOffice(args.data)
+    counter = iter(range(1, 1 << 30))
+    # the serial port first: a wrong setting or a busy port stops us before anything listens
+    serial_start = start_serial(args, po, counter) if args.serial else None
     po.gateway = Gateway(po)
     po.fetcher = Fetcher(po, po.gateway)
     if po.gateway.enabled:
@@ -57,39 +65,115 @@ def serve(args):
     # always running, cheap when idle: per-user smtp/fetch settings may be added while we run
     threading.Thread(target=po.gateway.run_sender, daemon=True).start()
     threading.Thread(target=po.fetcher.run, daemon=True).start()
-    counter = iter(range(1, 1 << 30))
 
-    def listen(port):
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((args.host, port))
-        srv.listen(4)
-        log.info("post office %s, %d users, listening on %s:%d", po.name, len(po.users), args.host, port)
+    def listen(srv, port, telnet):
+        log.info("post office %s, %d users, listening on %s:%d%s", po.name, len(po.users), args.host,
+                 port, " (Telnet)" if telnet else "")
         while True:
             conn, addr = srv.accept()
-            threading.Thread(target=handle, args=(conn, addr, po, next(counter), args.line_bps),
-                             daemon=True).start()
+            if telnet:
+                from .telnet import serve_connection
 
-    if args.serial:
-        # a client on a serial port that expects a Hayes modem (ccmail/modem.py)
-        from .modem import Modem, open_port
-        ser = open_port(args.serial, args.baud, rtscts=args.rtscts)
-        modem = Modem(ser, args.capture, name="serial")
-        bps = args.line_bps or args.baud
+                def tcall(sock, conn=conn, addr=addr):
+                    handle(sock, addr, po, next(counter), args.line_bps)
+                threading.Thread(target=serve_connection, args=(conn, tcall, f"telnet {addr[0]}:{addr[1]}"),
+                                 daemon=True).start()
+            else:
+                threading.Thread(target=handle, args=(conn, addr, po, next(counter), args.line_bps),
+                                 daemon=True).start()
 
-        def serial_call(sock):
-            handle(sock, (args.serial, args.baud), po, next(counter), bps)
-
-        threading.Thread(target=modem.serve, args=(serial_call,), daemon=True).start()
-        if args.serial_only:
-            threading.Event().wait()
+    if serial_start:
+        serial_start()
 
     # 3264 (0CC0h) is the port newer clients and peer post offices use over TCP/IP, raw session
     # bytes (newer-client-check.md item 12, router-to-router.md 1.2)
-    ports = args.port or [5003, 3264]
-    for p in ports[1:]:
-        threading.Thread(target=listen, args=(p,), daemon=True).start()
-    listen(ports[0])
+    listeners = []
+    if not args.serial_only:
+        listeners += [(p, bool(args.telnet)) for p in (args.port or [5003, 3264])]
+    listeners += [(p, True) for p in (args.telnet_port or [])]
+    if not listeners:
+        threading.Event().wait()
+    socks = []
+    for p, telnet in listeners:
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((args.host, p))
+        srv.listen(4)
+        socks.append((srv, p, telnet))
+    for srv, p, telnet in socks[1:]:
+        threading.Thread(target=listen, args=(srv, p, telnet), daemon=True).start()
+    listen(*socks[0])
+
+
+def check_serve_options(args):
+    """Options that need --serial or --modem; returns an error text or None."""
+    if not args.serial:
+        given = [o for o, v in (("--baud", args.baud), ("--framing", args.framing), ("--flow", args.flow),
+                                ("--rtscts", args.rtscts), ("--capture", args.capture),
+                                ("--modem", args.modem), ("--serial-only", args.serial_only))
+                 if v]
+        if given:
+            return f"only with --serial: {', '.join(given)}"
+    if not args.modem:
+        given = [o for o, v in (("--modem-init", args.modem_init),
+                                ("--modem-autoanswer", args.modem_autoanswer is not None)) if v]
+        if given:
+            return f"only with --modem: {', '.join(given)}"
+    if args.serial_only and args.telnet_port:
+        return "--serial-only listens on no TCP port; leave out --telnet-port or --serial-only"
+    if args.rtscts and args.flow and args.flow != "rtscts":
+        return f"--rtscts contradicts --flow {args.flow}"
+    return None
+
+
+def start_serial(args, po, counter):
+    """--serial: the modem emulator for a client on a cable, or (--modem) our own modem."""
+    from .serialport import SettingsError, check_settings, describe, open_port, physical, Port, Capture
+    flow = args.flow or ("rtscts" if args.rtscts else None)
+    try:
+        settings, warnings = check_settings(args.serial, args.baud, args.framing, flow,
+                                            role="modem" if args.modem else "line")
+        if args.modem:
+            from .hayes import HayesModem, parse_init
+            init = parse_init(args.modem_init)
+    except SettingsError as e:
+        sys.exit(f"--serial {args.serial}: {e}")
+    for w in warnings:
+        log.warning("%s: %s", args.serial, w)
+    try:
+        ser = open_port(args.serial, settings)
+    except SettingsError as e:
+        sys.exit(str(e))
+    log.info("serial %s: %s", args.serial, describe(settings))
+    if args.modem:
+        port = Port(ser, Capture(args.capture), name="modem")
+        try:
+            modem = HayesModem(port, init, autoanswer=args.modem_autoanswer, name="modem")
+        except SettingsError as e:
+            sys.exit(f"--modem: {e}")
+
+        def modem_call(sock, speed):
+            bps = args.line_bps or speed
+            if speed and speed == settings.get("baudrate") and not args.line_bps:
+                log.warning("modem: CONNECT %d = the port speed: the modem may report its DTE speed, "
+                            "not the line's (set it to report the carrier speed, e.g. ATW2 or S95, "
+                            "or give --line-bps)", speed)
+            if args.line_bps and speed and speed != args.line_bps:
+                log.info("modem: CONNECT %s, link timed for --line-bps %d", speed, args.line_bps)
+            handle(sock, (args.serial, speed or 0), po, next(counter), bps)
+
+        target = (modem.serve, (modem_call,))
+    else:
+        from .modem import Modem
+        speed = settings.get("baudrate") if physical(args.serial) else (args.line_bps or 9600)
+        modem = Modem(ser, args.capture, name="serial", connect_speed=speed)
+        bps = args.line_bps or speed
+
+        def serial_call(sock):
+            handle(sock, (args.serial, speed), po, next(counter), bps)
+
+        target = (modem.serve, (serial_call,))
+    return threading.Thread(target=target[0], args=target[1], daemon=True).start
 
 
 def send(args):
@@ -130,8 +214,15 @@ def call(args):
     if not dest:
         sys.exit(f"post office {args.po} is not configured in po.json")
     cfg = po.post_office_cfg(dest)
-    host, port = cfg["connect"].rsplit(":", 1)
     mode = {"LSEC": LSEC, "HSEC": HSEC, "RAW": RAW}[cfg.get("mode", "HSEC").upper()]
+    if cfg.get("dial"):
+        failed = call_by_modem(po, dest, capture=args.capture)
+        if failed:
+            sys.exit(f"call to {dest} failed: {failed}")
+        return
+    if not cfg.get("connect"):
+        sys.exit(f'post office {dest} has neither "connect" (host:port) nor "dial" in po.json')
+    host, port = cfg["connect"].rsplit(":", 1)
     sock = socket.create_connection((host, int(port)), timeout=30)
     sock.settimeout(None)
     try:
@@ -140,6 +231,65 @@ def call(args):
         log.info("call to %s ended: %s", dest, e)
     finally:
         sock.close()
+
+
+def call_by_modem(po, dest, capture=None):
+    """Call post office `dest` through a modem: po.json entry "dial" (e.g. "ATDT5551234"),
+    "modem" (device or rfc2217:// URL), optional "baud", "framing", "flow" (the port to the
+    modem), "modem_init" ("ATZ;AT E0 V1 Q0 &C1 &D2 S0=0" or a list). The call owns the port: a
+    running `serve --modem` on the same device must be stopped first (a local device is opened
+    exclusively, so the second opener fails). Returns None on success, else what failed."""
+    from .hayes import DialFailed, HayesModem, ModemError, check_command, parse_init
+    from .link import HSEC, LSEC, RAW
+    from .serialport import Capture, Port, PortClosed, SettingsError, check_settings, open_port
+    from .session import call_post_office
+    cfg = po.post_office_cfg(dest)
+    mode = {"LSEC": LSEC, "HSEC": HSEC, "RAW": RAW}[cfg.get("mode", "HSEC").upper()]
+    url = cfg.get("modem")
+    if not url:
+        return f'po.json {dest}: "dial" needs "modem" (the device or rfc2217:// URL of our modem)'
+    try:
+        settings, warnings = check_settings(url, cfg.get("baud"), cfg.get("framing"), cfg.get("flow"),
+                                            role="modem")
+        init = parse_init(cfg.get("modem_init"))
+        check_command(cfg["dial"], "dial string")
+    except SettingsError as e:
+        return f"po.json {dest}: {e}"
+    for w in warnings:
+        log.warning("%s: %s", url, w)
+    try:
+        ser = open_port(url, settings)
+    except SettingsError as e:
+        return f"{e} (the call needs the modem port to itself: is serve --modem using it?)"
+    port = Port(ser, Capture(capture), name=f"modem-{dest}")
+    modem = HayesModem(port, init, name=f"modem-{dest}")
+    failed = None
+
+    def run(sock, speed):
+        try:
+            call_post_office(po, dest, sock, mode, f"call-{dest}", line_bps=speed)
+        except (LinkClosed, LinkTimeout, Refused) as e:
+            log.info("call to %s ended: %s", dest, e)
+        except Exception:
+            log.exception("call to %s failed", dest)
+        finally:
+            sock.close()
+
+    try:
+        modem.init()
+        speed, first = modem.dial(cfg["dial"])
+        modem.run_call(run, speed, first)      # the session's own outcome is in the log
+    except DialFailed as e:
+        failed = f"{cfg['dial']}: {e.result}"
+    except (ModemError, PortClosed) as e:
+        failed = str(e)
+    finally:
+        try:
+            modem.hangup()
+        except Exception as e:
+            log.info("hang-up: %s", e)
+        port.close()
+    return failed
 
 
 def directory_cmd(args):
@@ -321,20 +471,56 @@ def main():
     p = argparse.ArgumentParser(prog="ccmail.server")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("serve")
+    s = sub.add_parser("serve", formatter_class=argparse.RawDescriptionHelpFormatter,
+                       description="Answer calls: TCP (raw bytes or Telnet) and/or a serial port "
+                                   "(a client on a cable that expects a modem, or our own modem).",
+                       epilog="examples:\n"
+                              "  serve --data D                                   raw TCP on 5003 and 3264\n"
+                              "  serve --data D --telnet-port 2323                + a Telnet port (tcpser, terminal servers)\n"
+                              "  serve --data D --serial /dev/ttyUSB0 --baud 2400 --serial-only\n"
+                              "                                                   HP 200LX on a cable (modem emulation)\n"
+                              "  serve --data D --serial rfc2217://ts:7001 --baud 9600 --framing 8N1\n"
+                              "  serve --data D --serial /dev/ttyS0 --modem --baud 38400 --flow rtscts\n"
+                              "                                                   our own modem answers RING\n"
+                              "See README.md, Connections.")
     s.add_argument("--data", required=True)
-    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--host", default="127.0.0.1", help="address the TCP ports listen on")
     s.add_argument("--port", type=int, action="append",
-                   help="TCP port to listen on (repeatable; default 5003 and 3264)")
+                   help="TCP port carrying raw session bytes (repeatable; default 5003 and 3264)")
+    s.add_argument("--telnet", action="store_true",
+                   help="the --port ports (or 5003 and 3264) speak Telnet instead of raw bytes")
+    s.add_argument("--telnet-port", type=int, action="append",
+                   help="an extra TCP port that speaks Telnet (RFC 854/855; BINARY, SGA, RFC 2217 "
+                        "COM-PORT-OPTION acknowledged); repeatable")
     s.add_argument("--line-bps", type=int,
                    help="speed of the line behind the connection (e.g. a modem or serial bridge); "
-                        "times retransmissions from when a frame has left the line")
-    s.add_argument("--serial", help="serial device with a client that expects a Hayes modem "
-                                    "(e.g. /dev/ttyUSB0); answers AT commands, CONNECT on dial")
-    s.add_argument("--baud", type=int, default=9600, help="serial speed (the client's INI speed)")
-    s.add_argument("--rtscts", action="store_true", help="hardware flow control on the serial port")
-    s.add_argument("--capture", help="record every serial byte (tools/proxy.py .bin format)")
-    s.add_argument("--serial-only", action="store_true", help="do not listen on TCP")
+                        "times retransmissions from when a frame has left the line. "
+                        "With --modem it overrides the CONNECT speed")
+    g = s.add_argument_group("serial port (only with --serial)")
+    g.add_argument("--serial", metavar="DEV|URL",
+                   help="serial port: a device (/dev/ttyUSB0) or a pyserial URL (rfc2217://host:port, "
+                        "socket://host:port, loop://). Without --modem: a client on it expects a "
+                        "Hayes modem; we answer its AT commands and say CONNECT <port speed> on dial")
+    g.add_argument("--baud", type=int,
+                   help="port speed (default 9600); a rate the port takes (300..115200 typical). "
+                        "Not for socket:// and loop:// (no physical port)")
+    g.add_argument("--framing", metavar="8N1",
+                   help="data bits 7/8, parity N/E/O/M/S, stop bits 1/2 (default 8N1); 7 bits = the "
+                        "protocol's ASCII mode only")
+    g.add_argument("--flow", choices=("none", "rtscts", "xonxoff", "dsrdtr"),
+                   help="flow control (default none); xonxoff = ASCII mode only")
+    g.add_argument("--rtscts", action="store_true", help="same as --flow rtscts (kept for scripts)")
+    g.add_argument("--capture", help="record every serial byte (tools/proxy.py .bin format)")
+    g.add_argument("--serial-only", action="store_true", help="do not listen on TCP at all")
+    g = s.add_argument_group("our own modem on --serial (answer mode)")
+    g.add_argument("--modem", action="store_true",
+                   help="a real Hayes modem is on --serial: init it, answer RING with ATA, take the "
+                        "line speed from CONNECT, hang up (DTR drop, +++ ATH0) after each call")
+    g.add_argument("--modem-init", metavar='"ATZ;AT..."',
+                   help='init commands separated by ";" (default "ATZ;AT E0 V1 Q0 &C1 &D2 S0=0"); '
+                        "each must answer OK, at most 40 characters after AT")
+    g.add_argument("--modem-autoanswer", type=int, metavar="N",
+                   help="let the modem answer after N rings (adds ATS0=N) instead of ATA on RING")
     s.set_defaults(func=serve)
     s = sub.add_parser("send")
     s.add_argument("--data", required=True)
@@ -347,9 +533,12 @@ def main():
     s.add_argument("--folder")
     s.add_argument("--attach", action="append", help="file to attach (repeatable)")
     s.set_defaults(func=send)
-    s = sub.add_parser("call")
+    s = sub.add_parser("call", help="call another post office now: TCP (\"connect\") or a modem (\"dial\")")
     s.add_argument("--data", required=True)
-    s.add_argument("po", help="post office to call (configured in po.json post_offices)")
+    s.add_argument("po", help='post office to call (po.json post_offices: "connect": "host:port", or '
+                              '"dial": "ATDT..." with "modem": DEV|rfc2217://..., optional "baud", '
+                              '"framing", "flow", "modem_init"; the call needs the modem port to itself)')
+    s.add_argument("--capture", help="with \"dial\": record every byte on the modem port")
     s.set_defaults(func=call)
     s = sub.add_parser("directory", help="send the directory to users as a CCMUPDAT update")
     s.add_argument("--data", required=True)

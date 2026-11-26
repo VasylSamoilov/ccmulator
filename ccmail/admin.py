@@ -336,5 +336,6 @@ def delete_post_office(po, name, force=False, notify=True):
 
 def list_post_offices(po):
     po.refresh()
-    return [(n, c.get("connect", ""), c.get("mode", ""), len(po.routed(n)))
+    return [(n, c.get("connect") or (f"dial {c['dial']}" if c.get("dial") else ""), c.get("mode", ""),
+             len(po.routed(n)))
             for n, c in sorted(po._cfg.get("post_offices", {}).items())]

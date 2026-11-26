@@ -460,11 +460,12 @@ def send_order(messages):
     return sorted(messages, key=rank)          # sorted() is stable: arrival order kept per class
 
 
-def call_post_office(po, dest, sock, mode, name="out"):
+def call_post_office(po, dest, sock, mode, name="out", line_bps=None):
     """We call another post office (router-to-router.md 1.3/1.4 and 7.2): opener (packet mode),
     80 -> 81, our name, 8B -> call password, its 82/83 + its name, our 82; we send first (its route
-    queue), then 88, then receive its messages until its 88."""
-    link = Link(sock, name, mode=mode)
+    queue), then 88, then receive its messages until its 88. line_bps = the line's speed when
+    known (a modem's CONNECT), for the link's line clock."""
+    link = Link(sock, name, mode=mode, speed=line_bps)
     call = Call(link, po, name)
     if mode != RAW:
         if not link.call_open(OPENER):
