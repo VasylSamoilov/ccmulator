@@ -35,7 +35,8 @@ It does not include, and does not need, any Lotus or HP software.
 - **Post office to post office**: mail routing to and from peer post offices, calling them and
   answering their calls.
 - **Internet gateway**: SMTP in and out, with the address, header and attachment mapping of
-  `spec/smtp-link.md`; gateway aliases (`sales@yourdomain`, or any full address, to a user).
+  `spec/smtp-link.md`; gateway aliases (`sales@yourdomain`, or any full address, to a user);
+  a smarthost with STARTTLS or implicit TLS and a checked certificate.
 - **Per-user internet mail**: a user's own email address (From, envelope sender, inbound
   matching), her own outgoing SMTP server (STARTTLS, SSL), and fetching from her own POP3, POP3S,
   IMAP or IMAPS account into her cc:Mail mailbox, polled in the background and at the start of her
@@ -334,7 +335,7 @@ There is no call scheduler yet.
       "gateway": {
         "post_office": "INTERNET", "domain": "example.org",
         "listen": "127.0.0.1:2525", "smarthost": "127.0.0.1:2526",
-        "starttls": false, "username": "", "password": "",
+        "security": "none", "verify_tls": true, "username": "", "password": "",
         "retry_seconds": 3600, "retry_times": 72,
         "aliases": {"sales": "Smith, Ann", "info@company.com": "user"}
       }
@@ -355,7 +356,9 @@ There is no call scheduler yet.
 | post office `connect` | `host:port` to call it at over TCP |
 | post office `mode` | packet mode when we call it: `LSEC`, `HSEC` (default) or `RAW` |
 | post office `dial`, `modem` | call it through our own modem instead: the dial command (`ATDT...`) and the modem's device or `rfc2217://` URL; optional `baud`, `framing`, `flow`, `modem_init` (see [Connections](#connections)) |
-| `gateway` | the internet gateway: its `post_office` name in the directory (default `INTERNET`), the mail `domain` of local users (default `localhost`), inbound SMTP `listen` address (none = no listener), outbound `smarthost` (with `starttls`, `username`, `password`), retries every `retry_seconds` (default 3600), `retry_times` (default 72) |
+| `gateway` | the internet gateway: its `post_office` name in the directory (default `INTERNET`), the mail `domain` of local users (default `localhost`), inbound SMTP `listen` address (none = no listener), outbound `smarthost` (`host:port`), retries every `retry_seconds` (default 3600), `retry_times` (default 72) |
+| gateway `security`, `verify_tls` | the smarthost connection: `none` (default, plain SMTP) \| `starttls` (fails if the relay does not offer it) \| `ssl` (implicit TLS, e.g. port 465); `verify_tls` (default true) checks the relay's certificate and name, as for a user's `smtp`. `"starttls": true` is the older spelling of `"security": "starttls"` |
+| gateway `username`, `password` | AUTH at the smarthost (in clear text with `security` `none`) |
 | gateway `aliases` | inbound address -> user: a local part (for the gateway `domain` only) or a full address (any domain); case does not matter |
 | user `email` | the user's own internet address: From and envelope sender of the mail she writes, and inbound mail to it (any domain) reaches her |
 | user `smtp` | her own outgoing server: `host`, `port` (default 587, 465 for `ssl`), `security` `starttls` (default) \| `ssl` \| `none`, `user`, `password`, `verify_tls` (default true) |
@@ -542,12 +545,16 @@ and `/etc/postfix/transport` (run `postmap /etc/postfix/transport` after editing
 - **Outbound route:** mail of users without their own `smtp` goes to the `smarthost`, with
   whatever From applies (her `email` may be on another domain; the relay may refuse that). Without
   a `smarthost` that mail is accepted and waits in `outbound/` until one is set.
+- **The smarthost on localhost** is plain SMTP (`security` `none`, the default). Postfix relays
+  for it without AUTH because 127.0.0.1 is in its `mynetworks` (the default since Postfix 3.0,
+  `mynetworks_style = host`). If you set `"security": "starttls"` towards a local MTA whose
+  certificate is self-signed (a distribution's "snakeoil" certificate), the connection now fails
+  on the certificate check: add `"verify_tls": false`, or stay plain on localhost.
 - **Without a local MTA:** point `smarthost` (`host:port`, the port is required) at your
-  provider's relay on port 587, with `"starttls": true, "username": ..., "password": ...`. The
-  smarthost connection is plain SMTP, upgraded with STARTTLS when `starttls` is set (it fails if
-  the relay does not offer it); it does not do implicit TLS (port 465), and the relay's
-  certificate is not checked. A user's own `smtp` checks it (`verify_tls`), so for a relay across
-  the internet, per-user `smtp` or a local MTA is the safer choice. Without `starttls`, a
+  provider's relay: port 587 with `"security": "starttls"`, or 465 with `"security": "ssl"`
+  (implicit TLS), plus `"username"` and `"password"`. The relay's certificate and host name are
+  checked (`verify_tls`, default true), as for a user's own `smtp`; `starttls` fails if the relay
+  does not offer it, so the password never goes out in clear text. With `security` `none`, a
   `username` and `password` go out in clear text.
 - **The listener** speaks plain SMTP without STARTTLS or AUTH and answers 550 at RCPT for an
   address it does not know. Postfix as above accepts any address of the domain first and then

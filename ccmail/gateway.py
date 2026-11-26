@@ -16,7 +16,10 @@ po.json:
         "domain": "example.org",          # local users are <name>@domain
         "listen": "127.0.0.1:2525",       # inbound SMTP (internet -> cc:Mail)
         "smarthost": "127.0.0.1:2526",    # outbound SMTP relay (cc:Mail -> internet)
-        "starttls": false, "username": "", "password": "",
+        "security": "none",               # smarthost: "none" (default) | "starttls" | "ssl"
+        "verify_tls": true,               # check the smarthost's certificate (starttls/ssl)
+        "starttls": false,                # older form of "security": "starttls"
+        "username": "", "password": "",
         "retry_seconds": 3600, "retry_times": 72,   # defaults (smtp-link.md §7)
         "rfc822_header_item": false,      # attach the header as RFC822.TXT (needs file items)
         "aliases": {"sales": "Smith, Ann", "info@company.com": "user"}   # inbound, before the rules
@@ -158,6 +161,8 @@ class Gateway:
         self.listen = cfg.get("listen")
         self.smarthost = cfg.get("smarthost")
         self.starttls = cfg.get("starttls", False)
+        self.security = str(cfg.get("security") or ("starttls" if self.starttls else "none")).lower()
+        self.verify_tls = bool(cfg.get("verify_tls", True))
         self.username = cfg.get("username", "")
         self.password = cfg.get("password", "")
         self.retry_seconds = cfg.get("retry_seconds", 3600)
@@ -209,10 +214,14 @@ class Gateway:
         return None, None
 
     def config_errors(self):
-        """Problems in the per-user settings, for the log at start."""
+        """Problems in the gateway and per-user settings, for the log at start."""
         from . import fetch
         out = []
         seen = {}
+        try:
+            self.smarthost_security()
+        except ConfigError as x:
+            out.append(str(x))
         for canon, e in self._user_entries():
             if e.get("smtp"):
                 try:
@@ -396,19 +405,19 @@ class Gateway:
         if not self.smarthost:
             return None, None
         host, port = self.smarthost.rsplit(":", 1)
+        security = self.smarthost_security()
+        # the certificate is checked like a user's smtp (verify_tls); "starttls" fails if the
+        # relay does not offer it, so the password never goes out in clear text
+        return (lambda: open_smtp(host, int(port), security, self.username, self.password,
+                                  self.verify_tls)), self.smarthost
 
-        def shared():
-            s = smtplib.SMTP(host, int(port), timeout=60)
-            try:
-                if self.starttls:
-                    s.starttls()
-                if self.username:
-                    s.login(self.username, self.password)
-            except BaseException:
-                s.close()
-                raise
-            return s
-        return shared, self.smarthost
+    def smarthost_security(self):
+        """The smarthost's "security" ("starttls": true is the older form). Raises ConfigError."""
+        if self.security not in SMTP_SECURITY:
+            raise ConfigError(f'gateway "security" must be one of {", ".join(SMTP_SECURITY)}')
+        if self.starttls and self.security != "starttls":
+            raise ConfigError(f'gateway "starttls": true contradicts "security": "{self.security}"')
+        return self.security
 
     def send_queue(self):
         if not os.path.isdir(self.outbox):

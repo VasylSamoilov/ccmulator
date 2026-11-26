@@ -2,8 +2,10 @@
 # Copyright 2026 Vasyl Samoilov
 """Gateway: per-user email address, per-user outgoing SMTP, aliases, the precedence rule (a user
 without settings behaves as before; user settings win; no fallback to the smarthost), the MIME
-part layout of smtp-link.md §2.4 and the product name. Fake SMTP servers on localhost threads, no
-network. Data in a scratch directory (CCMAIL_TEST_DIR, else the system temp directory)."""
+part layout of smtp-link.md §2.4 and the product name; smarthost TLS. Fake SMTP servers on
+localhost threads (TLS with a self-signed certificate made at test time, if openssl is
+installed), no network. Data in a scratch directory (CCMAIL_TEST_DIR, else the system temp
+directory)."""
 import base64
 import email
 import email.policy
@@ -11,10 +13,13 @@ import json
 import os
 import shutil
 import socket
+import ssl
 import struct
+import subprocess
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from ccmail import PRODUCT, admin
 from ccmail import message as M
@@ -28,11 +33,29 @@ WORK = os.path.join(os.environ.get("CCMAIL_TEST_DIR") or os.path.join(tempfile.g
                     "gateway-tests")
 
 
-class FakeSMTP:
-    """Records each transaction: {"from", "rcpt", "data", "auth"}; reject = RCPT reply code."""
+def make_cert(folder):
+    """Self-signed certificate for 127.0.0.1 (CN and IP SAN): (server context, cert path) or
+    None without openssl."""
+    if not shutil.which("openssl"):
+        return None
+    cert, key = os.path.join(folder, "cert.pem"), os.path.join(folder, "key.pem")
+    r = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+                        "-days", "1", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+                       capture_output=True)
+    if r.returncode:
+        return None
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    return ctx, cert
 
-    def __init__(self, reject=None):
+
+class FakeSMTP:
+    """Records each transaction: {"from", "rcpt", "data", "auth", "tls"}; reject = RCPT reply
+    code; tls = server context for STARTTLS, or for implicit TLS with implicit_tls."""
+
+    def __init__(self, reject=None, tls=None, implicit_tls=False):
         self.mails, self.reject = [], reject
+        self.tls, self.implicit_tls = tls, implicit_tls
         self.srv = socket.socket()
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.srv.bind(("127.0.0.1", 0))
@@ -52,10 +75,19 @@ class FakeSMTP:
         self.srv.close()
 
     def _session(self, conn):
+        cur = {"from": None, "rcpt": [], "auth": None, "tls": False}
+        try:
+            if self.implicit_tls:
+                conn = self.tls.wrap_socket(conn, server_side=True)
+                cur["tls"] = True
+        except (OSError, ssl.SSLError):
+            conn.close()
+            return
         f = conn.makefile("rb")
-        send = lambda s: conn.sendall(s.encode() + b"\r\n")  # noqa: E731
+
+        def send(s):
+            conn.sendall(s.encode() + b"\r\n")
         send("220 fake ESMTP")
-        cur = {"from": None, "rcpt": [], "auth": None}
         try:
             while True:
                 line = f.readline()
@@ -65,7 +97,14 @@ class FakeSMTP:
                 verb = cmd[:4].upper()
                 if verb == "EHLO":
                     send("250-fake")
+                    if self.tls and not cur["tls"]:
+                        send("250-STARTTLS")
                     send("250 AUTH PLAIN")
+                elif verb == "STAR" and self.tls and not cur["tls"]:
+                    send("220 go ahead")
+                    conn = self.tls.wrap_socket(conn, server_side=True)
+                    f = conn.makefile("rb")
+                    cur["tls"] = True
                 elif verb == "AUTH":
                     _authzid, user, pw = base64.b64decode(cmd.split()[2]).split(b"\0")   # AUTH PLAIN
                     cur["auth"] = (user.decode(), pw.decode())
@@ -95,7 +134,7 @@ class FakeSMTP:
                     return
                 else:
                     send("250 ok")
-        except OSError:
+        except (OSError, ssl.SSLError):
             pass
         finally:
             conn.close()
@@ -358,6 +397,91 @@ class InboundTest(GatewayBase):
         gw_names = [M.text(d) for t, d in ann[0].addr_tlvs if t in (M.TAG_SENT_TO, M.TAG_CC_SENT)]
         self.assertIn("dave@example.net", gw_names)
         self.assertFalse({"ann@isp.example", "sales@mypost.example"} & {n.lower() for n in gw_names})
+
+
+class SmarthostTLSTest(GatewayBase):
+    """The shared smarthost: STARTTLS and implicit TLS check the certificate (verify_tls)."""
+
+    def setUp(self):
+        super().setUp()
+        made = make_cert(self.root)
+        if not made:
+            self.skipTest("no openssl")
+        self.ctx, self.cert = made
+
+    def relay(self, **kw):
+        srv = FakeSMTP(tls=self.ctx, implicit_tls=kw.pop("implicit", False))
+        self.addCleanup(srv.close)
+        gw = dict({"post_office": "INTERNET", "domain": "mypost.example", "smarthost": f"127.0.0.1:{srv.port}",
+                   "retry_seconds": 0, "retry_times": 3}, **kw)
+        self.configure(gateway=gw)
+        return srv
+
+    def queued_error(self):
+        out = os.path.join(self.root, "outbound")
+        metas = [f for f in os.listdir(out) if f.endswith(".json")]
+        self.assertEqual(len(metas), 1)
+        with open(os.path.join(out, metas[0])) as f:
+            return json.load(f)["error"]
+
+    def test_starttls_self_signed_refused(self):
+        srv = self.relay(starttls=True)
+        self.send("bob")
+        self.assertEqual(srv.mails, [])
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", self.queued_error())
+
+    def test_security_starttls_self_signed_refused(self):
+        srv = self.relay(security="starttls", username="u", password="p")
+        self.send("bob")
+        self.assertEqual(srv.mails, [])
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", self.queued_error())
+
+    def test_starttls_no_verify(self):
+        srv = self.relay(starttls=True, verify_tls=False, username="u", password="p")
+        self.send("bob")
+        self.assertEqual(len(srv.mails), 1)
+        self.assertEqual((srv.mails[0]["tls"], srv.mails[0]["auth"]), (True, ("u", "p")))
+
+    def test_starttls_trusted_certificate(self):
+        """Verification on, the certificate trusted (SSL_CERT_FILE): delivered."""
+        srv = self.relay(security="starttls")
+        with mock.patch.dict(os.environ, {"SSL_CERT_FILE": self.cert}):
+            self.send("bob")
+        self.assertEqual(len(srv.mails), 1)
+        self.assertTrue(srv.mails[0]["tls"])
+
+    def test_implicit_tls(self):
+        srv = self.relay(security="ssl", implicit=True)
+        self.send("bob")
+        self.assertEqual(srv.mails, [])
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", self.queued_error())
+        self.po.update(lambda cfg: cfg["gateway"].__setitem__("verify_tls", False))
+        self.gw = self.po.gateway = Gateway(self.po)
+        self.gw.send_queue()
+        self.assertEqual(len(srv.mails), 1)
+        self.assertTrue(srv.mails[0]["tls"])
+
+    def test_starttls_not_offered(self):
+        self.configure(gateway={"post_office": "INTERNET", "domain": "mypost.example", "security": "starttls",
+                                "smarthost": f"127.0.0.1:{self.smarthost.port}", "retry_seconds": 0,
+                                "retry_times": 3, "username": "u", "password": "p"})
+        self.send("bob")
+        self.assertEqual(self.smarthost.mails, [])
+        self.assertIn("STARTTLS", self.queued_error())
+
+    def test_plain_as_before(self):
+        self.configure()
+        self.send("bob")
+        self.assertEqual(len(self.smarthost.mails), 1)
+        self.assertFalse(self.smarthost.mails[0]["tls"])
+
+    def test_config_errors(self):
+        self.relay(security="tls")
+        self.assertTrue(any('"security"' in e for e in self.gw.config_errors()))
+        self.send("bob")
+        self.assertIn('"security"', self.queued_error())        # kept, retried, not sent plain
+        self.relay(security="none", starttls=True)
+        self.assertTrue(any("contradicts" in e for e in self.gw.config_errors()))
 
 
 class SessionTest(GatewayBase):
