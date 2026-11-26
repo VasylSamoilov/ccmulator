@@ -14,6 +14,16 @@ office for its clients and peers. It is compatible with:
 
 It does not include, and does not need, any Lotus or HP software.
 
+## Disclaimer
+
+ccmulator is an independent personal project, made for preserving and recovering data from old
+hardware and software. It is not affiliated with, endorsed by, or supported by IBM, Lotus, HP or
+any other company, and it contains none of their code. Compatibility comes from observing how the
+original systems behave. It is not production-grade software: it is not meant for commercial use
+or for anything critical, and comes with no warranty (see the GPL). If it helps you as a starting
+point for recovering your own old mail or files, it has done its job. Keep backups of the
+originals, and work on copies.
+
 ## Features
 
 - **Connections**: raw TCP (an emulator's modem, a serial bridge, newer clients), Telnet ports
